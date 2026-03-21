@@ -1,0 +1,3 @@
+[submodule "VideoChat-R1"]
+	path = VideoChat-R1
+	url = git@github.com:OpenGVLab/VideoChat-R1.git
