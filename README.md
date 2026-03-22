@@ -44,8 +44,8 @@ pip install -r requirements.txt
 - [x] Update VideoChat-R1.5 to utilize UCF-Crime frames and annotations
 - [x] Update VideoChat-R1.5 to utilize UCF-Crime video-level labels
 - [x] Test GRPO on VideoChat-R1.5
-- [] Test HY-WU parameter generation
-- [] Integrate parameter generation into GRPO
+- [x] Test HY-WU parameter generation
+- [x] Integrate parameter generation into GRPO
     - generate -> inject -> respond -> reinforce
 - [] Add parameter generator to Qwen2-VL backbone
     - Ensure parameter generator incorporates vision (video frames) and textual information (prompt)

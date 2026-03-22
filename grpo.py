@@ -289,7 +289,7 @@ def main(script_args, training_args, model_args):
         args=training_args,
         train_dataset=dataset,
         eval_dataset=None,
-        peft_config=get_peft_config(model_args),
+        peft_config=None,
         attn_implementation=model_args.attn_implementation,
         max_pixels=script_args.max_pixels,
         min_pixels=script_args.min_pixels,

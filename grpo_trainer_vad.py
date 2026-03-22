@@ -56,6 +56,10 @@ if is_peft_available():
 if is_wandb_available():
     import wandb
 
+from wu.config import ParameterGeneratorConfig
+from wu.generator import ParameterGenerator
+from wu.mixin import inject_pg
+
 # What we call a reward function is a callable that takes a list of prompts and completions and returns a list of
 # rewards. When it's a string, it's a model ID, so it's loaded as a pretrained model.
 RewardFunc = Union[str, PreTrainedModel, Callable[[list, list], list[float]]]
@@ -271,7 +275,39 @@ Please ONLY reply according to this format, don't give me any other words."""
                 False if args.gradient_checkpointing else model_init_kwargs.get("use_cache")
             )
             if "Qwen2-VL" in model_id:
-                model = Qwen2VLForConditionalGeneration.from_pretrained(model, **model_init_kwargs)
+                model_init_kwargs["torch_dtype"] = torch.bfloat16
+                model_init_kwargs["attn_implementation"] = "flash_attention_2"
+                # TODO: Make this work for more backbones
+                self.parameter_generator_config = ParameterGeneratorConfig(
+                    token_dim=512,
+                    rank=16,
+                    alpha=64,
+                    input_dim=3584,
+                    dim_accumulation=4,
+                    d_model=4096,
+                    head_dim=128,
+                    num_base_model_layers=28,
+                    output_dim=3584,
+                    num_pg_layers=24,
+                    prefix="model.language_model.layers.",
+                    pg_mapping={
+                        "self_attn.q_proj": {"lora_A_dim": 3584, "lora_B_dim": 3584},
+                        "self_attn.k_proj": {"lora_A_dim": 3584, "lora_B_dim": 512},
+                        "self_attn.v_proj": {"lora_A_dim": 3584, "lora_B_dim": 512},
+                        "self_attn.o_proj": {"lora_A_dim": 3584, "lora_B_dim": 3584},
+                        "mlp.gate_proj": {"lora_A_dim": 3584, "lora_B_dim": 18944},
+                        "mlp.up_proj": {"lora_A_dim": 3584, "lora_B_dim": 18944},
+                        "mlp.down_proj": {"lora_A_dim": 18944, "lora_B_dim": 3584},
+                    },
+                    torch_dtype=torch.bfloat16,
+                )
+                self.parameter_generator = ParameterGenerator(self.parameter_generator_config)
+                self.parameter_generator.train()
+                #model = Qwen2VLForConditionalGeneration.from_pretrained(model, **model_init_kwargs)
+                model: Qwen2VLForConditionalGeneration = inject_pg(
+                    self.parameter_generator.config, Qwen2VLForConditionalGeneration
+                ).from_pretrained(model, **model_init_kwargs)
+                model.enable_pg()
             elif "Qwen2.5-VL" in model_id:
                 # breakpoint()
                 model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
@@ -462,6 +498,37 @@ Please ONLY reply according to this format, don't give me any other words."""
         return torch.stack(per_token_logps)
 
 
+    def _get_per_token_logps_with_pg(
+        self,
+        model,
+        input_ids,
+        attention_mask,
+        pg_state_dict,
+        pixel_values_videos=None,
+        video_grid_thw=None,
+        pixel_values=None,
+        image_grid_thw=None,
+    ):
+        outputs = self._forward_with_pg(
+            model=model,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            pg_state_dict=pg_state_dict,
+            pixel_values_videos=pixel_values_videos,
+            video_grid_thw=video_grid_thw,
+            pixel_values=pixel_values,
+            image_grid_thw=image_grid_thw,
+        )
+        logits = outputs.logits[:, :-1, :]
+        labels = input_ids[:, 1:]
+
+        per_token_logps = []
+        for logits_row, labels_row in zip(logits, labels):
+            log_probs = logits_row.log_softmax(dim=-1)
+            token_log_prob = torch.gather(log_probs, dim=1, index=labels_row.unsqueeze(1)).squeeze(1)
+            per_token_logps.append(token_log_prob)
+        return torch.stack(per_token_logps)
+
 
     # Trainer "prepares" the inputs before calling `compute_loss`. It converts to tensor and move to device.
     # Since we preprocess the data in `compute_loss`, we need to override this method to skip this step.
@@ -562,17 +629,40 @@ Please ONLY reply according to this format, don't give me any other words."""
         elif 'pixel_values' in prompt_inputs:
             pixel_values = prompt_inputs["pixel_values"]
             image_grid_thw = prompt_inputs["image_grid_thw"]
-        # Generate completions
         
+        # Generate completions        
+        # Step 2: Extract hidden states
+        condition = self._extract_condition(
+            model=model,
+            input_ids=prompt_ids,
+            attention_mask=prompt_mask,
+            pixel_values=None,
+            image_grid_thw=None,
+            pixel_values_videos=pixel_values_videos,
+            video_grid_thw=video_grid_thw,
+        )
+        breakpoint()
+
+        # Step 3: PG generates LoRA parameters
+        pg_state_dict = self._build_pg_state_dict(condition)
+        breakpoint()
+
+        model.set_pg_state_dict(pg_state_dict)
         with unwrap_model_for_generation(model, self.accelerator) as unwrapped_model:
-            prompt_completion_ids = unwrapped_model.generate(**prompt_inputs, generation_config=self.generation_config, use_cache=False)
+            # Step 4: Generate with PG-LoRA
+            prompt_completion_ids = unwrapped_model.generate(
+                **prompt_inputs,
+                generation_config=self.generation_config,
+                use_cache=False,
+            )
 
             prompt_length = prompt_ids.size(1)
             prompt_ids = prompt_completion_ids[:, :prompt_length]
             completion_ids = prompt_completion_ids[:, prompt_length:]
             prompt_mask = prompt_mask.repeat_interleave(self.num_generations, dim=0)
+        model.clear_pg_state_dict()
 
-        #breakpoint()
+        breakpoint()
         is_eos = completion_ids == self.processing_class.eos_token_id
         device = self.accelerator.device
         eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long, device=device)
@@ -593,9 +683,20 @@ Please ONLY reply according to this format, don't give me any other words."""
             pixel_values_videos = None
             video_grid_thw = None
             
-        per_token_logps = self._get_per_token_logps(model, prompt_completion_ids, attention_mask, pixel_values_videos, video_grid_thw, pixel_values, image_grid_thw)
-        # Get rid of the prompt (-1 because of the shift done in get_per_token_logps)
+        model.set_pg_state_dict(pg_state_dict)
+        per_token_logps = self._get_per_token_logps_with_pg(
+            model=model,
+            input_ids=prompt_completion_ids,
+            attention_mask=attention_mask,
+            pg_state_dict=pg_state_dict,
+            pixel_values_videos=pixel_values_videos,
+            video_grid_thw=video_grid_thw,
+            pixel_values=pixel_values,
+            image_grid_thw=image_grid_thw,
+        )
         per_token_logps = per_token_logps[:, prompt_length - 1 :]
+        model.clear_pg_state_dict()
+        breakpoint()
 
         with torch.inference_mode():
             if self.ref_model is not None:
@@ -755,3 +856,56 @@ Please ONLY reply according to this format, don't give me any other words."""
         )
 
         model_card.save(os.path.join(self.args.output_dir, "README.md"))
+
+    def _extract_condition(
+        self,
+        model,
+        input_ids,
+        attention_mask,
+        pixel_values=None,
+        image_grid_thw=None,
+        pixel_values_videos=None,
+        video_grid_thw=None,
+    ):
+        with torch.no_grad():
+            outputs = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                pixel_values=pixel_values,
+                image_grid_thw=image_grid_thw,
+                pixel_values_videos=pixel_values_videos,
+                video_grid_thw=video_grid_thw,
+                output_hidden_states=True,
+                use_cache=False,
+                return_dict=True,
+            )
+            condition = outputs.hidden_states[-1][:, -1, :]
+        return condition
+    
+    def _build_pg_state_dict(self, condition):
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            pg_output = self.parameter_generator(condition=condition)
+        return {k: v for k, v in pg_output.items()}
+    
+    def _forward_with_pg(
+        self,
+        model,
+        input_ids,
+        attention_mask,
+        pg_state_dict,
+        pixel_values=None,
+        image_grid_thw=None,
+        pixel_values_videos=None,
+        video_grid_thw=None,
+    ):
+        return model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            pixel_values=pixel_values,
+            image_grid_thw=image_grid_thw,
+            pixel_values_videos=pixel_values_videos,
+            video_grid_thw=video_grid_thw,
+            pg_state_dict=pg_state_dict,
+            use_cache=False,
+            return_dict=True,
+        )
