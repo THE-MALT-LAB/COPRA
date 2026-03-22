@@ -1,5 +1,8 @@
 salloc.sh
 env.txt
+ucf_crime
+*.json
+ckpt
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
