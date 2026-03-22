@@ -41,9 +41,9 @@ pip install -r requirements.txt
 
 ## TODO
 
-- [] Update VideoChat-R1.5 to utilize UCF-Crime frames and annotations
-- [] Update VideoChat-R1.5 to utilize UCF-Crime video-level labels
-- [] Test GRPO on VideoChat-R1.5
+- [x] Update VideoChat-R1.5 to utilize UCF-Crime frames and annotations
+- [x] Update VideoChat-R1.5 to utilize UCF-Crime video-level labels
+- [x] Test GRPO on VideoChat-R1.5
 - [] Test HY-WU parameter generation
 - [] Integrate parameter generation into GRPO
     - generate -> inject -> respond -> reinforce

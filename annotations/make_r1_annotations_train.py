@@ -4,7 +4,7 @@ import json
 import re
 
 video_folder = "/home/cse_h2/dzj0055/HYWUChat-R1.5/ucf_crime/videos/"
-duration_filepath = "/home/cse_h2/dzj0055/HYWUChat-R1.5/ucf_crime/annotations/all.txt" # TODO: Change this to my_all for more accurate reading for duration
+duration_filepath = "/home/cse_h2/dzj0055/HYWUChat-R1.5/ucf_crime/annotations/my_all.txt"
 event_filepath = "/home/cse_h2/dzj0055/HYWUChat-R1.5/ucf_crime/annotations/Temporal_Anomaly_Annotation_for_Testing_Videos.txt"
 
 segment_length = sys.maxsize # in seconds basically infinity
