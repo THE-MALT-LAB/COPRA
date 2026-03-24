@@ -280,15 +280,15 @@ Please ONLY reply according to this format, don't give me any other words."""
                 # TODO: Make this work for more backbones
                 self.parameter_generator_config = ParameterGeneratorConfig(
                     token_dim=512,
-                    rank=16,
-                    alpha=64,
+                    rank=8, # 16 OOM
+                    alpha=16, # 2x rank
                     input_dim=3584,
                     dim_accumulation=4,
-                    d_model=4096,
-                    head_dim=128,
+                    d_model=512,
+                    head_dim=512,
                     num_base_model_layers=28,
                     output_dim=3584,
-                    num_pg_layers=24,
+                    num_pg_layers=21,
                     prefix="model.language_model.layers.",
                     pg_mapping={
                         "self_attn.q_proj": {"lora_A_dim": 3584, "lora_B_dim": 3584},
@@ -303,13 +303,23 @@ Please ONLY reply according to this format, don't give me any other words."""
                 )
                 self.parameter_generator = ParameterGenerator(self.parameter_generator_config)
                 self.parameter_generator.train()
+                if not args.resume_from_checkpoint:
+                    # Initialize LoRA B Projection with close to zeros to match HY-WU paper
+                    # close to because otherwise optimization is slow
+                    torch.nn.init.zeros_( self.parameter_generator.model.proj_out_B.bias )
+                    torch.nn.init.zeros_( self.parameter_generator.model.proj_out_B.weight )
                 #model = Qwen2VLForConditionalGeneration.from_pretrained(model, **model_init_kwargs)
                 model: Qwen2VLForConditionalGeneration = inject_pg(
                     self.parameter_generator.config, Qwen2VLForConditionalGeneration
                 ).from_pretrained(model, **model_init_kwargs)
+                #model.eval()
+                for param in model.model.parameters():
+                    # Saves memory! gradients will still backprop to parameter generator
+                    # source: https://discuss.pytorch.org/t/grad-through-frozen-weights/84672/3
+                    param.requires_grad = False
                 model.enable_pg()
             elif "Qwen2.5-VL" in model_id:
-                # breakpoint()
+                #breakpoint()
                 model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
                     model, 
                     torch_dtype=torch.bfloat16,
@@ -450,6 +460,9 @@ Please ONLY reply according to this format, don't give me any other words."""
             callbacks=callbacks,
             optimizers=optimizers,
         )
+        
+        self.accelerator.prepare( self.parameter_generator )
+        #self.dummy_tensor_2 = torch.ones(1, requires_grad=True, device=self.parameter_generator.device)
 
         # Gradient accumulation requires scaled loss. Normally, loss scaling in the parent class depends on whether the
         # model accepts loss-related kwargs. Since we compute our own loss, this check is irrelevant. We set
@@ -468,6 +481,72 @@ Please ONLY reply according to this format, don't give me any other words."""
                     self.reward_funcs[key][i] = self.accelerator.prepare_model(reward_func, evaluation_mode=True)
 
 
+    def create_optimizer(self):
+        """ Adapted from transformers source.
+        Setup the optimizer.
+
+        We provide a reasonable default that works well. If you want to use something else, you can pass a tuple in the
+        Trainer's init through `optimizers`, or subclass and override this method in a subclass.
+        """
+        # DO NOT USE WITH SAGEMAKER. UNTESTED!
+        #assert not is_sagemaker_mp_enabled()
+        opt_model = self.parameter_generator
+
+        if self.optimizer is None:
+            decay_parameters = self.get_decay_parameter_names(opt_model)
+            optimizer_grouped_parameters = [
+                {
+                    "params": [
+                        p for n, p in opt_model.named_parameters() if (n in decay_parameters and p.requires_grad)
+                    ],
+                    "weight_decay": self.args.weight_decay,
+                },
+                {
+                    "params": [
+                        p for n, p in opt_model.named_parameters() if (n not in decay_parameters and p.requires_grad)
+                    ],
+                    "weight_decay": 0.0,
+                },
+            ]
+
+            if self.optimizer_cls_and_kwargs is not None:
+                optimizer_cls, optimizer_kwargs = self.optimizer_cls_and_kwargs
+            else:
+                optimizer_cls, optimizer_kwargs = self.get_optimizer_cls_and_kwargs(self.args, opt_model)
+
+            # Overwrite `params` in case it's created by `get_optimizer_cls_and_kwargs`
+            # e.g. for GaLore optimizer.
+            if "params" in optimizer_kwargs:
+                optimizer_grouped_parameters = optimizer_kwargs.pop("params")
+
+            # Overwrite `model` in case it's created by `get_optimizer_cls_and_kwargs`
+            # e.g. for LOMO optimizer.
+            if "model" in optimizer_kwargs:
+                optimizer_grouped_parameters = optimizer_kwargs.pop("model")
+
+            # For layer-wise dummy optimizers we overwrite optimizer_grouped_parameters with `optimizer_dict`
+            # to avoid arguments conflicts.
+            if "optimizer_dict" in optimizer_kwargs:
+                optimizer_grouped_parameters = optimizer_kwargs.pop("optimizer_dict")
+
+            self.optimizer = optimizer_cls(optimizer_grouped_parameters, **optimizer_kwargs)
+            #breakpoint()
+
+            if "bitsandbytes" in str(optimizer_cls) and optimizer_kwargs.get("optim_bits", None) == 8:
+                import bitsandbytes
+
+                manager = bitsandbytes.optim.GlobalOptimManager.get_instance()
+
+                skipped = 0
+                for module in opt_model.modules():
+                    if isinstance(module, nn.Embedding):
+                        skipped += sum({p.data_ptr(): p.numel() for p in module.parameters()}.values())
+                        logger.info(f"skipped {module}: {skipped / 2**20}M params")
+                        manager.register_module_override(module, "weight", {"optim_bits": 32})
+                        logger.debug(f"bitsandbytes: will optimize {module} in fp32")
+                logger.info(f"skipped: {skipped / 2**20}M params")
+
+        return self.optimizer
 
     def _get_train_sampler(self, dataset) -> Optional[torch.utils.data.Sampler]:
         # import pdb; pdb.set_trace()
@@ -494,38 +573,6 @@ Please ONLY reply according to this format, don't give me any other words."""
         for logits_row, input_ids_row in zip(logits, input_ids):
             log_probs = logits_row.log_softmax(dim=-1)
             token_log_prob = torch.gather(log_probs, dim=1, index=input_ids_row.unsqueeze(1)).squeeze(1)
-            per_token_logps.append(token_log_prob)
-        return torch.stack(per_token_logps)
-
-
-    def _get_per_token_logps_with_pg(
-        self,
-        model,
-        input_ids,
-        attention_mask,
-        pg_state_dict,
-        pixel_values_videos=None,
-        video_grid_thw=None,
-        pixel_values=None,
-        image_grid_thw=None,
-    ):
-        outputs = self._forward_with_pg(
-            model=model,
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            pg_state_dict=pg_state_dict,
-            pixel_values_videos=pixel_values_videos,
-            video_grid_thw=video_grid_thw,
-            pixel_values=pixel_values,
-            image_grid_thw=image_grid_thw,
-        )
-        logits = outputs.logits[:, :-1, :]
-        labels = input_ids[:, 1:]
-
-        per_token_logps = []
-        for logits_row, labels_row in zip(logits, labels):
-            log_probs = logits_row.log_softmax(dim=-1)
-            token_log_prob = torch.gather(log_probs, dim=1, index=labels_row.unsqueeze(1)).squeeze(1)
             per_token_logps.append(token_log_prob)
         return torch.stack(per_token_logps)
 
@@ -586,6 +633,10 @@ Please ONLY reply according to this format, don't give me any other words."""
         # return dummy_loss
         if return_outputs:
             raise ValueError("The GRPOTrainer does not support returning outputs")
+
+        # Move parameter generator to same device as model
+        #model.module.clear_pg_state_dict() # JIC if ref model not separate from base llm
+        #self.parameter_generator.to( model.device )
         
         if 'video_path' in inputs[0]:
             # messages = [{"role": "user", "content": [{"type": "video", "video": inputs[0]["video_path"], "total_pixels": 3584 * 28 * 28, "min_pixels": 16 * 28 * 28,},]}]
@@ -631,7 +682,7 @@ Please ONLY reply according to this format, don't give me any other words."""
             image_grid_thw = prompt_inputs["image_grid_thw"]
         
         # Generate completions        
-        # Step 2: Extract hidden states
+        # Step 2: Extract BxD hidden states
         condition = self._extract_condition(
             model=model,
             input_ids=prompt_ids,
@@ -641,13 +692,13 @@ Please ONLY reply according to this format, don't give me any other words."""
             pixel_values_videos=pixel_values_videos,
             video_grid_thw=video_grid_thw,
         )
-        breakpoint()
+        #breakpoint() # verified that condition extracted from model as HY WU expects
 
-        # Step 3: PG generates LoRA parameters
-        pg_state_dict = self._build_pg_state_dict(condition)
-        breakpoint()
-
-        model.set_pg_state_dict(pg_state_dict)
+        with torch.no_grad():
+            # Step 3: PG generates LoRA parameters
+            pg_state_dict = self._build_pg_state_dict(condition)
+            #breakpoint() # verified that dimensions align with llm
+            model.module.set_pg_state_dict(pg_state_dict)
         with unwrap_model_for_generation(model, self.accelerator) as unwrapped_model:
             # Step 4: Generate with PG-LoRA
             prompt_completion_ids = unwrapped_model.generate(
@@ -660,9 +711,9 @@ Please ONLY reply according to this format, don't give me any other words."""
             prompt_ids = prompt_completion_ids[:, :prompt_length]
             completion_ids = prompt_completion_ids[:, prompt_length:]
             prompt_mask = prompt_mask.repeat_interleave(self.num_generations, dim=0)
-        model.clear_pg_state_dict()
+        model.module.clear_pg_state_dict()
 
-        breakpoint()
+        #breakpoint() # verified that completions are correct at init
         is_eos = completion_ids == self.processing_class.eos_token_id
         device = self.accelerator.device
         eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long, device=device)
@@ -682,22 +733,7 @@ Please ONLY reply according to this format, don't give me any other words."""
             image_grid_thw = prompt_inputs["image_grid_thw"].repeat_interleave(self.num_generations, dim=0)
             pixel_values_videos = None
             video_grid_thw = None
-            
-        model.set_pg_state_dict(pg_state_dict)
-        per_token_logps = self._get_per_token_logps_with_pg(
-            model=model,
-            input_ids=prompt_completion_ids,
-            attention_mask=attention_mask,
-            pg_state_dict=pg_state_dict,
-            pixel_values_videos=pixel_values_videos,
-            video_grid_thw=video_grid_thw,
-            pixel_values=pixel_values,
-            image_grid_thw=image_grid_thw,
-        )
-        per_token_logps = per_token_logps[:, prompt_length - 1 :]
-        model.clear_pg_state_dict()
-        breakpoint()
-
+        
         with torch.inference_mode():
             if self.ref_model is not None:
                 ref_per_token_logps = self._get_per_token_logps(self.ref_model, prompt_completion_ids, attention_mask, pixel_values_videos, video_grid_thw)
@@ -705,6 +741,21 @@ Please ONLY reply according to this format, don't give me any other words."""
                 with self.accelerator.unwrap_model(model).disable_adapter():
                     ref_per_token_logps = self._get_per_token_logps(model, prompt_completion_ids, attention_mask, pixel_values_videos, video_grid_thw)
         ref_per_token_logps = ref_per_token_logps[:, prompt_length - 1 :]
+
+        # DDP needs module
+        # Step 3: PG generates LoRA parameters
+        pg_state_dict = self._build_pg_state_dict(condition)
+        # https://discuss.pytorch.org/t/checkpoint-with-no-grad-requiring-inputs-problem/19117/7
+        #self.dummy_tensor_1 = torch.ones(1, dtype=prompt_completion_ids.dtype, requires_grad=True, device=self.parameter_generator.device)
+        #prompt_completion_ids = prompt_completion_ids + self.dummy_tensor_1 - self.dummy_tensor_1
+        #self.dummy_tensor_2 = self.dummy_tensor_2.to(pixel_values_videos.dtype)
+        #pixel_values_videos = pixel_values_videos + self.dummy_tensor_2 - self.dummy_tensor_2
+        #breakpoint() # verified that dimensions align with llm
+        model.module.set_pg_state_dict(pg_state_dict)
+        #breakpoint()
+        per_token_logps = self._get_per_token_logps(model, prompt_completion_ids, attention_mask, pixel_values_videos, video_grid_thw)
+        per_token_logps = per_token_logps[:, prompt_length - 1 :]
+        #breakpoint()
 
         # Compute the KL divergence between the model and the reference model
         per_token_kl = torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
@@ -768,6 +819,7 @@ Please ONLY reply according to this format, don't give me any other words."""
         per_token_loss = -(per_token_loss - self.beta * per_token_kl)
         # per_token_loss = -(per_token_loss)
         loss = ((per_token_loss * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
+        #breakpoint()
 
         # Log the metrics
         completion_length = self.accelerator.gather_for_metrics(completion_mask.sum(1)).float().mean().item()
@@ -788,6 +840,10 @@ Please ONLY reply according to this format, don't give me any other words."""
         mean_kl = ((per_token_kl * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
         self._metrics["kl"].append(self.accelerator.gather_for_metrics(mean_kl).mean().item())
         torch.distributed.barrier()
+        """ print(loss)
+        for name, param in self.parameter_generator.named_parameters():
+            if 'proj_out_B' in name:
+                print(f"{name}: norm={param.data.norm().item():.8f}") """
         return loss
 
     def log(self, logs: dict[str, float], start_time: Optional[float] = None) -> None:
@@ -879,33 +935,24 @@ Please ONLY reply according to this format, don't give me any other words."""
                 use_cache=False,
                 return_dict=True,
             )
-            condition = outputs.hidden_states[-1][:, -1, :]
+            # Last layer. as shown in TransformerModel::forward
+            condition = outputs.hidden_states[-1].unsqueeze(1) # (B, 1, T, D)
+        #breakpoint()
         return condition
     
     def _build_pg_state_dict(self, condition):
+        #breakpoint()
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             pg_output = self.parameter_generator(condition=condition)
-        return {k: v for k, v in pg_output.items()}
-    
-    def _forward_with_pg(
-        self,
-        model,
-        input_ids,
-        attention_mask,
-        pg_state_dict,
-        pixel_values=None,
-        image_grid_thw=None,
-        pixel_values_videos=None,
-        video_grid_thw=None,
-    ):
-        return model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            pixel_values=pixel_values,
-            image_grid_thw=image_grid_thw,
-            pixel_values_videos=pixel_values_videos,
-            video_grid_thw=video_grid_thw,
-            pg_state_dict=pg_state_dict,
-            use_cache=False,
-            return_dict=True,
-        )
+        #breakpoint()
+        return pg_output
+
+    def _save(self, output_dir: Optional[str] = None, state_dict=None):
+        # If we are executing this function, we are the process zero, so we don't check for that.
+        output_dir = output_dir if output_dir is not None else self.args.output_dir
+        os.makedirs(output_dir, exist_ok=True)
+        print(f"Saving model checkpoint to {output_dir}")
+
+        # Good practice: save your training arguments together with the trained model
+        torch.save(self.args, os.path.join(output_dir, "training_args.bin"))
+        torch.save( self.parameter_generator.state_dict(), os.path.join(output_dir, "pg_weights.bin") )
