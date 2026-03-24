@@ -3,6 +3,7 @@ env.txt
 ucf_crime
 *.json
 ckpt
+*.txt
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

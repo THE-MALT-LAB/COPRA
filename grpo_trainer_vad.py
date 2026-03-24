@@ -288,7 +288,7 @@ Please ONLY reply according to this format, don't give me any other words."""
                     head_dim=512,
                     num_base_model_layers=28,
                     output_dim=3584,
-                    num_pg_layers=21,
+                    num_pg_layers=14,
                     prefix="model.language_model.layers.",
                     pg_mapping={
                         "self_attn.q_proj": {"lora_A_dim": 3584, "lora_B_dim": 3584},
@@ -817,6 +817,7 @@ Please ONLY reply according to this format, don't give me any other words."""
         # NOTE only for num_iteration == 1
         per_token_loss = torch.exp(per_token_logps - per_token_logps.detach()) * advantages.unsqueeze(1)
         per_token_loss = -(per_token_loss - self.beta * per_token_kl)
+        #breakpoint()
         # per_token_loss = -(per_token_loss)
         loss = ((per_token_loss * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
         #breakpoint()
@@ -924,19 +925,9 @@ Please ONLY reply according to this format, don't give me any other words."""
         video_grid_thw=None,
     ):
         with torch.no_grad():
-            outputs = model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                pixel_values=pixel_values,
-                image_grid_thw=image_grid_thw,
-                pixel_values_videos=pixel_values_videos,
-                video_grid_thw=video_grid_thw,
-                output_hidden_states=True,
-                use_cache=False,
-                return_dict=True,
-            )
-            # Last layer. as shown in TransformerModel::forward
-            condition = outputs.hidden_states[-1].unsqueeze(1) # (B, 1, T, D)
+            video_embeds = model.module.get_video_features(pixel_values_videos, video_grid_thw)
+            video_embeds = torch.cat(video_embeds, dim=0)
+        condition = video_embeds.unsqueeze(0).unsqueeze(1) # B,1,T,D
         #breakpoint()
         return condition
     
