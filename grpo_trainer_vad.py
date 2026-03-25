@@ -16,6 +16,7 @@ import os
 import textwrap
 from collections import defaultdict
 from typing import Any, Callable, Optional, Union
+import contextlib 
 
 import torch
 import torch.utils.data
@@ -947,3 +948,26 @@ Please ONLY reply according to this format, don't give me any other words."""
         # Good practice: save your training arguments together with the trained model
         torch.save(self.args, os.path.join(output_dir, "training_args.bin"))
         torch.save( self.parameter_generator.state_dict(), os.path.join(output_dir, "pg_weights.bin") )
+    
+    def training_step(
+        self, model, inputs, num_items_in_batch,
+    ) -> torch.Tensor:
+        tr_loss_step = super().training_step(model, inputs, num_items_in_batch)
+        do_sync_step = self.accelerator.sync_gradients
+        if do_sync_step:
+            # Since we perform prefetching, we need to manually set sync_gradients to True
+            self.accelerator.gradient_state._set_sync_gradients(True)
+
+            # Gradient clipping
+            if self.args.max_grad_norm is not None and self.args.max_grad_norm > 0:
+                grad_norm_context = contextlib.nullcontext
+                if self.is_tp_enabled:
+                    from torch.distributed._tensor.experimental import implicit_replication
+
+                    grad_norm_context = implicit_replication
+                with grad_norm_context():
+                    _grad_norm = self.accelerator.clip_grad_norm_(
+                        self.parameter_generator.parameters(),
+                        self.args.max_grad_norm,
+                    )
+        return tr_loss_step

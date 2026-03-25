@@ -21,7 +21,7 @@ torchrun --nnodes=1 \
     --output_dir $OUTDIR \
     --training_data /home/cse_h2/dzj0055/HYWUChat-R1.5/annotations/dataset_training_file.json \
     --dataset_name ucf_crime \
-    --max_completion_length 1024 \
+    --max_completion_length 256 \
     --num_generations 4 \
     --per_device_train_batch_size 1 \
     --gradient_accumulation_steps 1 \
@@ -33,7 +33,8 @@ torchrun --nnodes=1 \
     --attn_implementation flash_attention_2 \
     --num_train_epochs 1 \
     --run_name $WANDB_NAME \
-    --report_to tensorboard \
+    --report_to wandb \
     --save_steps 1000 \
     --learning_rate 1e-6 \
-    --save_only_model true
+    --save_only_model true \
+    --beta 0.1

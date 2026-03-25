@@ -183,7 +183,7 @@ class TTSdata(Dataset):
                 messages = [{"role": "user", "content": [{"type": "image", "image": example["image_path"]}]}]
                 image_inputs, video_inputs, video_kwargs = process_vision_info([messages], return_video_kwargs=True, client=client)
                 data_to_return["image_inputs"] = [image_inputs]
-            print(data_to_return.keys())
+            #print(data_to_return.keys())
             return data_to_return
         # data_to_return["use_preprocessed"] = [True] # Flag to indicate preprocessed data is used
         except Exception as e:

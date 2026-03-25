@@ -58,5 +58,5 @@ pip install -r requirements.txt
 - [x] Check if generated parameters are non-trivial over training
     - log generated parameter weight l2 norm with wandb over time
 - [x] added saving for parameter generator weights
-- [] Check if GRPO with parameter generation leads to stable rewards/losses over training   
+- [x] Check if GRPO with parameter generation leads to stable rewards/losses over training   
 - [] Add evaluation script from VERAS
