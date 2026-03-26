@@ -731,7 +731,7 @@ def fetch_video(ele: dict, client = None, image_factor: int = IMAGE_FACTOR, retu
             return images, process_info.pop("fps", 2.0)
         return images
 
-def fetch_clip(ele: dict, duration: float, client = None, image_factor: int = IMAGE_FACTOR, return_video_sample_fps: bool = False, return_gt: bool = False) -> torch.Tensor | list[Image.Image]:
+def fetch_clip(ele: dict, duration: float, client = None, image_factor: int = IMAGE_FACTOR, return_video_sample_fps: bool = False, return_gt: bool = False, my_frame_idx: list[int] = None) -> torch.Tensor | list[Image.Image]:
     video_reader_backend = get_video_reader_backend()
     assert video_reader_backend == "decord"
     # import pdb; pdb.set_trace()
@@ -753,17 +753,21 @@ def fetch_clip(ele: dict, duration: float, client = None, image_factor: int = IM
             video, sample_fps = VIDEO_READER_BACKENDS["torchvision"](ele)
 
         nframes, _, height, width = video.shape
-        start_time = 0.
-        end_time = duration
-        start_frame = round( start_time * sample_fps )
-        end_frame = min( math.ceil( end_time * sample_fps ), nframes )
-        # HARDCODED TODO: Make part of function args
-        num_sampled_frame = 8
-
-        max_num_frames = min(num_sampled_frame, nframes)
-        random_integers = np.arange(start_frame, end_frame, (end_frame - start_frame) / max_num_frames).astype(int).tolist() 
-        sorted_integers = np.sort(random_integers)
-        frame_idx = sorted_integers.astype(int)
+        if not my_frame_idx:
+            start_time = 0.
+            end_time = duration
+            start_frame = round( start_time * sample_fps )
+            end_frame = min( math.ceil( end_time * sample_fps ), nframes )
+            # HARDCODED TODO: Make part of function args
+            num_sampled_frame = 8
+            max_num_frames = min(num_sampled_frame, nframes)
+            random_integers = np.arange(start_frame, end_frame, (end_frame - start_frame) / max_num_frames).astype(int).tolist() 
+            sorted_integers = np.sort(random_integers)
+            frame_idx = sorted_integers.astype(int)
+        else:
+            frame_idx = my_frame_idx
+            num_sampled_frame = len(my_frame_idx)
+            max_num_frames = min(num_sampled_frame, nframes)
         #breakpoint()
 
         video = video[ frame_idx ]
@@ -848,6 +852,7 @@ def my_process_vision_info(
         durations: list[float],
         return_video_kwargs: bool = False,
         client = None,
+        my_frame_indices = None,
         return_gt = False
     ) -> tuple[list[Image.Image] | None, list[torch.Tensor | list[Image.Image]] | None, Optional[dict]]:
 
@@ -867,7 +872,8 @@ def my_process_vision_info(
                     vision_info, 
                     durations[idx], 
                     return_video_sample_fps=True, 
-                    client=client, return_gt=True
+                    client=client, return_gt=True,
+                    my_frame_idx=None if not my_frame_indices else my_frame_indices[idx]
                 )
                 gt_labels_list.append(gt_labels)
             else:

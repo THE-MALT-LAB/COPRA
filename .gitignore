@@ -3,6 +3,8 @@ env.txt
 ucf_crime
 *.json
 ckpt
+wandb
+scores
 *.txt
 
 # Byte-compiled / optimized / DLL files
