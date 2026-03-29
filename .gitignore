@@ -5,6 +5,7 @@ ucf_crime
 ckpt
 wandb
 scores
+scores_video_level_pg
 *.txt
 
 # Byte-compiled / optimized / DLL files

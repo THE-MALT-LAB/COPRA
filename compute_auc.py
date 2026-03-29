@@ -5,6 +5,7 @@ import pdb
 import math
 import numpy as np
 from scipy.stats import iqr
+import sys
 
 
 
@@ -12,7 +13,7 @@ ann_root = 'ucf_crime/annotations/UCF_eval_vera.json'
 # This is the folder for loading the saved vision features
 vision_folder = 'ucf_crime/ucf_crime_vision_features/'
 # This is the folder for saving the segment-level scores
-score_folder = './scores/'
+score_folder = sys.argv[1]
 
 
 def gaussian_kernel_original(x, mu, sigma):
@@ -71,12 +72,17 @@ with data_path.open(encoding='utf-8') as f:
 
 for v_i in range(len(annotation)):
     sample =  annotation[v_i]
-    key = sample['video'].split('/')[-1].split('.')[0]
+    key_filename = sample['video'].split('/')[-1]
+    key = key_filename.split('.')[0]
     print(key)
 
      
-    score_path = score_folder +key+'.json'
-    with open(score_path,'r') as f: score = json.load(f)
+    score_path = score_folder +key_filename+'.json'
+    try:
+        with open(score_path,'r') as f: score = json.load(f)
+    except FileNotFoundError:
+        print(f"{key_filename} not in scores folder")
+        continue
     result[key] = score
 
     
