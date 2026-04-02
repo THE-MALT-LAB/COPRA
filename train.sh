@@ -2,7 +2,7 @@
 export WANDB_PROJECT=Video-GRPO
 export WANDB_NAME=Qwen2.5_7b_TG
 
-export TRANSFOMERS_CACHE="/aiau001_scratch/dzj0055/HYWUChat-R1.5/cache/"
+export TRANSFORMERS_CACHE="/aiau001_scratch/dzj0055/HYWUChat-R1.5/cache/"
 export PYTHONPATH="VideoChat-R1/Videochat-R1.5/:HY-WU/:$PYTHONPATH"
 OUTDIR=ckpt/cotraining
 
