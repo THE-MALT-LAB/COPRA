@@ -1,0 +1,3 @@
+[submodule "VLM-R1"]
+	path = VLM-R1
+	url = git@github.com:om-ai-lab/VLM-R1.git
