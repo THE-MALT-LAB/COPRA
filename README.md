@@ -30,13 +30,17 @@ pip install --no-build-isolation flash_attn==2.7.4.post1
 ```shell
 cd VLM-R1/
 bash setup.sh
+pip install transformers==4.49.0
+pip install decord
+pip install timm
 ```
+NOTE: VLM-R1 will NOT work with higher transformers version v4.57.1 (from HY-WU/requirements.py) without more changes! InternLM2 exposes generate without inheriting from GenerationMixIn
 
 ## TODO
 
-- [] Update VLM-R1 to utilize UCF-Crime frames and annotations
-- [] Update VLM-R1 to utilize UCF-Crime video-level labels
-- [] Test GRPO on VLM-R1
+- [x] Update VLM-R1 to utilize UCF-Crime frames and annotations
+- [x] Update VLM-R1 to utilize UCF-Crime video-level labels
+- [x] Test GRPO on VLM-R1
 - [] Test HY-WU parameter generation
 - [] Integrate parameter generation into GRPO
     - generate -> inject -> respond -> reinforceE
