@@ -41,19 +41,19 @@ NOTE: VLM-R1 will NOT work with higher transformers version v4.57.1 (from HY-WU/
 - [x] Update VLM-R1 to utilize UCF-Crime frames and annotations
 - [x] Update VLM-R1 to utilize UCF-Crime video-level labels
 - [x] Test GRPO on VLM-R1
-- [] Test HY-WU parameter generation
-- [] Integrate parameter generation into GRPO
+- [x] Test HY-WU parameter generation
+- [x] Integrate parameter generation into GRPO
     - generate -> inject -> respond -> reinforceE
-- [] Add parameter generator to Qwen2-VL backbone
-    - Ensure parameter generator incorporates vision (video frames) and textual information (prompt)
+- [x] Add parameter generator to InternVL2 backbone
+    - Ensure parameter generator incorporates vision (video frames) alone
     - check wu/pipeline.py:generate
-- [] Add optimizer for parameter generator
+- [x] Add optimizer for parameter generator
 - [] Check if gradients pass to parameter generator NOT backbone
     - log parameter generator gradient l2 norm with wandb over time?
 - [] Test response generation with parameter generation
 - [] Test response generation with parameter generation after 2 GRPO updates
 - [] Check if generated parameters are non-trivial over training
     - log generated parameter weight l2 norm with wandb over time
-- [] added saving for parameter generator weights
+- [x] added saving for parameter generator weights
 - [] Check if GRPO with parameter generation leads to stable rewards/losses over training   
 - [] Add evaluation script from VERAS

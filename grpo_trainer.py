@@ -252,9 +252,51 @@ class MyGRPOTrainer(Trainer):
             False if args.gradient_checkpointing else model_init_kwargs.get("use_cache")
         )
         model_cls = self.vlm_module.get_model_class(model_id, model_init_kwargs)
-        model = model_cls.from_pretrained(model_id, **model_init_kwargs)
-
-        # TODO: Add parameter generator here
+        # Add parameter generator here
+        #breakpoint()
+        self.parameter_generator_config = ParameterGeneratorConfig(
+            token_dim=512,
+            rank=8, # 16 OOM
+            alpha=16, # 2x rank
+            input_dim=4096,
+            dim_accumulation=4,
+            d_model=512,
+            head_dim=512,
+            num_base_model_layers=32,
+            output_dim=4096,
+            num_pg_layers=16,
+            prefix="language_model.model.layers.",
+            pg_mapping={
+                # wqkv is fused QKV: in=4096, out=6144 (q=4096, k=1024, v=1024)
+                "attention.wqkv": {"lora_A_dim": 4096, "lora_B_dim": 6144},
+                "attention.wo":   {"lora_A_dim": 4096, "lora_B_dim": 4096},
+                # MLP: w1 and w3 are gate/up, w2 is down
+                "feed_forward.w1": {"lora_A_dim": 4096,  "lora_B_dim": 14336},
+                "feed_forward.w3": {"lora_A_dim": 4096,  "lora_B_dim": 14336},
+                "feed_forward.w2": {"lora_A_dim": 14336, "lora_B_dim": 4096},
+            },
+            torch_dtype=torch.bfloat16,
+        )
+        self.parameter_generator = ParameterGenerator(self.parameter_generator_config)
+        self.parameter_generator.train()
+        if not args.resume_from_checkpoint:
+            # Initialize LoRA B Projection with close to zeros to match HY-WU paper
+            # close to because otherwise optimization is slow
+            torch.nn.init.zeros_( self.parameter_generator.model.proj_out_B.bias )
+            torch.nn.init.zeros_( self.parameter_generator.model.proj_out_B.weight )
+        #breakpoint()
+        # JIC: use the class in self.vlm_module.model_config.architectures[0]
+        # check if needed and effective. should not be a problem though
+        model = inject_pg(
+            self.parameter_generator.config, model_cls
+        ).from_pretrained(model_id, **model_init_kwargs)
+        #breakpoint()
+        for param in model.model.parameters():
+            # Saves memory! gradients will still backprop to parameter generator
+            # source: https://discuss.pytorch.org/t/grad-through-frozen-weights/84672/3
+            param.requires_grad = False
+        model.enable_pg()
+        #breakpoint()
 
         # LoRA
         self.vision_modules_keywords = self.vlm_module.get_vision_modules_keywords()
@@ -277,14 +319,12 @@ class MyGRPOTrainer(Trainer):
             peft_config.target_modules = target_modules
             model = get_peft_model(model, peft_config)
 
-        # Freeze vision modules
+        # Freeze vision modules. unnecessary but leave in for now
         if freeze_vision_modules:
             print("Freezing vision modules...")
             for n, p in model.named_parameters():
                 if any(keyword in n for keyword in self.vision_modules_keywords):
                     p.requires_grad = False
-        
-        # TODO: Freeze other model parameters (ex. language model, mlp1)
         
         # Compute the number of trainable parameters and print the parameter that is trainable
         trainable_params = [p for p in model.parameters() if p.requires_grad]
@@ -297,7 +337,7 @@ class MyGRPOTrainer(Trainer):
         if args.gradient_checkpointing:
             model = self._enable_gradient_checkpointing(model, args)
 
-        # TODO: remove reference model
+        # TODO: remove reference model if too much memory required
         # Reference model
         self.beta = args.beta
         if self.beta == 0.0:
@@ -417,6 +457,7 @@ class MyGRPOTrainer(Trainer):
             callbacks=callbacks,
             optimizers=optimizers,
         )
+        self.accelerator.prepare( self.parameter_generator )
 
         # Check if the per_device_train/eval_batch_size * num processes can be divided by the number of generations
         num_processes = self.accelerator.num_processes
@@ -458,6 +499,73 @@ class MyGRPOTrainer(Trainer):
         for i, reward_func in enumerate(self.reward_funcs):
             if isinstance(reward_func, PreTrainedModel):
                 self.reward_funcs[i] = self.accelerator.prepare_model(reward_func, evaluation_mode=True)
+
+    def create_optimizer(self):
+        """ Adapted from transformers source.
+        Setup the optimizer.
+
+        We provide a reasonable default that works well. If you want to use something else, you can pass a tuple in the
+        Trainer's init through `optimizers`, or subclass and override this method in a subclass.
+        """
+        # DO NOT USE WITH SAGEMAKER. UNTESTED!
+        #assert not is_sagemaker_mp_enabled()
+        opt_model = self.parameter_generator
+
+        if self.optimizer is None:
+            decay_parameters = self.get_decay_parameter_names(opt_model)
+            optimizer_grouped_parameters = [
+                {
+                    "params": [
+                        p for n, p in opt_model.named_parameters() if (n in decay_parameters and p.requires_grad)
+                    ],
+                    "weight_decay": self.args.weight_decay,
+                },
+                {
+                    "params": [
+                        p for n, p in opt_model.named_parameters() if (n not in decay_parameters and p.requires_grad)
+                    ],
+                    "weight_decay": 0.0,
+                },
+            ]
+
+            if self.optimizer_cls_and_kwargs is not None:
+                optimizer_cls, optimizer_kwargs = self.optimizer_cls_and_kwargs
+            else:
+                optimizer_cls, optimizer_kwargs = self.get_optimizer_cls_and_kwargs(self.args, opt_model)
+
+            # Overwrite `params` in case it's created by `get_optimizer_cls_and_kwargs`
+            # e.g. for GaLore optimizer.
+            if "params" in optimizer_kwargs:
+                optimizer_grouped_parameters = optimizer_kwargs.pop("params")
+
+            # Overwrite `model` in case it's created by `get_optimizer_cls_and_kwargs`
+            # e.g. for LOMO optimizer.
+            if "model" in optimizer_kwargs:
+                optimizer_grouped_parameters = optimizer_kwargs.pop("model")
+
+            # For layer-wise dummy optimizers we overwrite optimizer_grouped_parameters with `optimizer_dict`
+            # to avoid arguments conflicts.
+            if "optimizer_dict" in optimizer_kwargs:
+                optimizer_grouped_parameters = optimizer_kwargs.pop("optimizer_dict")
+
+            self.optimizer = optimizer_cls(optimizer_grouped_parameters, **optimizer_kwargs)
+            #breakpoint()
+
+            if "bitsandbytes" in str(optimizer_cls) and optimizer_kwargs.get("optim_bits", None) == 8:
+                import bitsandbytes
+
+                manager = bitsandbytes.optim.GlobalOptimManager.get_instance()
+
+                skipped = 0
+                for module in opt_model.modules():
+                    if isinstance(module, nn.Embedding):
+                        skipped += sum({p.data_ptr(): p.numel() for p in module.parameters()}.values())
+                        logger.info(f"skipped {module}: {skipped / 2**20}M params")
+                        manager.register_module_override(module, "weight", {"optim_bits": 32})
+                        logger.debug(f"bitsandbytes: will optimize {module} in fp32")
+                logger.info(f"skipped: {skipped / 2**20}M params")
+        #breakpoint()
+        return self.optimizer
 
     def _enable_gradient_checkpointing(self, model: PreTrainedModel, args: GRPOConfig) -> PreTrainedModel:
         """Enables gradient checkpointing for the model."""
@@ -592,6 +700,17 @@ class MyGRPOTrainer(Trainer):
         #     prompt_inputs["attention_mask"] = prompt_mask
 
         # Generate completions
+        condition = self._extract_condition(
+            model=model,
+            pixel_values_videos=pixel_values_videos,
+        )
+        #breakpoint()
+        with torch.no_grad():
+            # Step 3: PG generates LoRA parameters
+            pg_state_dict = self._build_pg_state_dict(condition)
+            #breakpoint() # verified that dimensions align with llm
+            model.module.set_pg_state_dict(pg_state_dict)
+        #breakpoint()
         with unwrap_model_for_generation(model, self.accelerator) as unwrapped_model:
             generate_returned_result = unwrapped_model.generate(
                 **{k: v for k, v in prompt_inputs.items() if k not in self.vlm_module.get_non_generate_params()}, 
@@ -607,6 +726,7 @@ class MyGRPOTrainer(Trainer):
                 # So the returned result of the `generate` method only contains the completion ids
                 completion_ids = generate_returned_result
                 prompt_completion_ids = torch.cat([prompt_ids, completion_ids], dim=1)
+        model.module.clear_pg_state_dict()
         #breakpoint()
         # Mask everything after the first EOS token
         is_eos = completion_ids == self.processing_class.eos_token_id
@@ -757,6 +877,16 @@ class MyGRPOTrainer(Trainer):
         attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
 
         # Get the current policy's log probabilities
+        # TODO: Ensure condition extraction work on the batch level
+        # TODO: also pay attention to OOM technically generated params are same for all pixel values
+        # since num generations is a multiple of forward batch size
+        # therefore repetition of extracted condition could suffice (or caching if time permits)
+        condition = self._extract_condition(
+            model=model,
+            pixel_values_videos=pixel_values_videos,
+        )
+        pg_state_dict = self._build_pg_state_dict(condition)
+        model.module.set_pg_state_dict(pg_state_dict)
         per_token_logps = self._get_per_token_logps(model, input_ids, attention_mask, **multimodal_inputs)
         # Get rid of the prompt (-1 because of the shift done in get_per_token_logps)
         per_token_logps = per_token_logps[:, prompt_ids.size(1) - 1:]
@@ -794,6 +924,44 @@ class MyGRPOTrainer(Trainer):
         self._metrics["clip_ratio"].append(self.accelerator.gather_for_metrics(clip_ratio).mean().item())
         #breakpoint()
         return loss
+
+    def _extract_condition(
+        self, model,
+        pixel_values_videos=None,
+    ):
+        with torch.no_grad():
+            #breakpoint()
+            video_embeds = model.extract_feature(pixel_values_videos)
+            #video_embeds = torch.flatten(video_embeds, start_dim=0, end_dim=1)
+        #breakpoint()
+        #condition = video_embeds.unsqueeze(0).unsqueeze(1) # B,1,T,D
+        #breakpoint()
+        return condition
+
+    def _build_pg_state_dict(self, condition):
+        #breakpoint()
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            pg_output = self.parameter_generator(condition=condition)
+        #breakpoint()
+        return pg_output
+    
+    def _clip_grad_norm(self, model):
+        """Clip gradients to max_grad_norm. Returns the pre-clip gradient norm."""
+        #breakpoint()
+        return self.accelerator.clip_grad_norm_(
+            self.parameter_generator.parameters(), 
+            self.args.max_grad_norm
+        )
+
+    def _save(self, output_dir: Optional[str] = None, state_dict=None):
+        # If we are executing this function, we are the process zero, so we don't check for that.
+        output_dir = output_dir if output_dir is not None else self.args.output_dir
+        os.makedirs(output_dir, exist_ok=True)
+        print(f"Saving model checkpoint to {output_dir}")
+
+        # Good practice: save your training arguments together with the trained model
+        torch.save(self.args, os.path.join(output_dir, "training_args.bin"))
+        torch.save( self.parameter_generator.state_dict(), os.path.join(output_dir, "pg_weights.bin") )
 
     def log(self, logs: dict[str, float], start_time: Optional[float] = None) -> None:
         metrics = {key: sum(val) / len(val) for key, val in self._metrics.items()}  # average the metrics

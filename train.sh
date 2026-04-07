@@ -17,6 +17,7 @@ torchrun --nproc_per_node="1" \
     --image_root /aiau001_scratch/dzj0055/ucf_crime/videos/ \
     --freeze_vision_modules true \
     --max_anyres_num 1 \
+    --num_iterations 1 \
     --num_generations 4 \
     --per_device_train_batch_size 4 \
     --gradient_accumulation_steps 1 \
