@@ -48,12 +48,12 @@ NOTE: VLM-R1 will NOT work with higher transformers version v4.57.1 (from HY-WU/
     - Ensure parameter generator incorporates vision (video frames) alone
     - check wu/pipeline.py:generate
 - [x] Add optimizer for parameter generator
-- [] Check if gradients pass to parameter generator NOT backbone
+- [x] Check if gradients pass to parameter generator NOT backbone
     - log parameter generator gradient l2 norm with wandb over time?
-- [] Test response generation with parameter generation
-- [] Test response generation with parameter generation after 2 GRPO updates
-- [] Check if generated parameters are non-trivial over training
+- [x] Test response generation with parameter generation
+- [x] Test response generation with parameter generation after 2 GRPO updates
+- [x] Check if generated parameters are non-trivial over training
     - log generated parameter weight l2 norm with wandb over time
 - [x] added saving for parameter generator weights
-- [] Check if GRPO with parameter generation leads to stable rewards/losses over training   
+- [x] Check if GRPO with parameter generation leads to stable rewards/losses over training   
 - [] Add evaluation script from VERAS

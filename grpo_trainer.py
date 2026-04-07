@@ -61,10 +61,31 @@ if is_wandb_available():
     import wandb
 
 from open_r1.vlm_modules.vlm_module import VLMBaseModule
+
+from wu.config import ParameterGeneratorConfig
+from wu.generator import ParameterGenerator
+from wu.mixin import inject_pg
+
 # What we call a reward function is a callable that takes a list of prompts and completions and returns a list of
 # rewards. When it's a string, it's a model ID, so it's loaded as a pretrained model.
 RewardFunc = Union[str, PreTrainedModel, Callable[[list, list], list[float]]]
 
+class MyClipParameterGeneratorGradNormCallback(TrainerCallback):
+    "A callback that clips gradient norms for models (besides the backbone foundation model)"
+    def __init__(self, max_grad_norm=1, accelerator=None, parameter_generator=None):
+        self.max_grad_norm = max_grad_norm
+        self.accelerator = accelerator
+        self.parameter_generator = parameter_generator
+
+    def on_pre_optimizer_step(self, args, state, control, **kwargs):
+        """Clip gradients to max_grad_norm. Returns the pre-clip gradient norm."""
+        #breakpoint()
+        pre_clip_norm = self.accelerator.clip_grad_norm_(
+            self.parameter_generator.parameters(), 
+            self.max_grad_norm
+        )
+        #breakpoint()
+        return control
 
 class RepeatRandomSampler(Sampler):
     """
@@ -216,6 +237,7 @@ class MyGRPOTrainer(Trainer):
         freeze_vision_modules: Optional[bool] = False,
         attn_implementation: str = "flash_attention_2",
         torch_dtype: str = "bfloat16",
+        num_sampled_frames: int = None,
         **kwargs,
     ):
         # Args
@@ -225,6 +247,7 @@ class MyGRPOTrainer(Trainer):
             args = GRPOConfig(f"{model_name}-GRPO")
         
         self.vlm_module = vlm_module
+        self.num_sampled_frames = num_sampled_frames
 
         # Models
         # Trained model
@@ -285,13 +308,13 @@ class MyGRPOTrainer(Trainer):
             torch.nn.init.zeros_( self.parameter_generator.model.proj_out_B.bias )
             torch.nn.init.zeros_( self.parameter_generator.model.proj_out_B.weight )
         #breakpoint()
-        # JIC: use the class in self.vlm_module.model_config.architectures[0]
-        # check if needed and effective. should not be a problem though
+        # Class in self.vlm_module.model_config.architectures[0] is string
+        internvl_model_class = model_cls.from_pretrained(model_id, trust_remote_code=True).__class__
         model = inject_pg(
-            self.parameter_generator.config, model_cls
+            self.parameter_generator.config, internvl_model_class
         ).from_pretrained(model_id, **model_init_kwargs)
         #breakpoint()
-        for param in model.model.parameters():
+        for param in model.parameters():
             # Saves memory! gradients will still backprop to parameter generator
             # source: https://discuss.pytorch.org/t/grad-through-frozen-weights/84672/3
             param.requires_grad = False
@@ -337,21 +360,21 @@ class MyGRPOTrainer(Trainer):
         if args.gradient_checkpointing:
             model = self._enable_gradient_checkpointing(model, args)
 
-        # TODO: remove reference model if too much memory required
+        # Removed reference model since too much memory required
         # Reference model
         self.beta = args.beta
         if self.beta == 0.0:
             # If beta is 0.0, the reference model is not needed
             self.ref_model = None
         elif is_deepspeed_zero3_enabled():
-            self.ref_model = AutoModelForCausalLM.from_pretrained(model_id, **model_init_kwargs)
+            self.ref_model = None
         elif is_peft_model(model):
             # If PEFT is used, the reference model is not needed since the adapter can be disabled
             # to revert to the initial model.
             self.ref_model = None
         else:
             # If PEFT configuration is not provided, create a reference model based on the initial model.
-            self.ref_model = create_reference_model(model)
+            self.ref_model = None
 
         # Processing class
         if processing_class is None:
@@ -371,8 +394,8 @@ class MyGRPOTrainer(Trainer):
                 pad_token_id = processing_class.pad_token_id
 
         self.vlm_module.post_model_init(model, processing_class)
-        if self.beta:
-            self.vlm_module.post_model_init(self.ref_model, processing_class)
+        #if self.beta:
+        #    self.vlm_module.post_model_init(self.ref_model, processing_class)
 
         # Reward functions
         if not isinstance(reward_funcs, list):
@@ -458,6 +481,7 @@ class MyGRPOTrainer(Trainer):
             optimizers=optimizers,
         )
         self.accelerator.prepare( self.parameter_generator )
+        self.add_callback( MyClipParameterGeneratorGradNormCallback( self.args.max_grad_norm, self.accelerator, self.parameter_generator ) )
 
         # Check if the per_device_train/eval_batch_size * num processes can be divided by the number of generations
         num_processes = self.accelerator.num_processes
@@ -700,22 +724,24 @@ class MyGRPOTrainer(Trainer):
         #     prompt_inputs["attention_mask"] = prompt_mask
 
         # Generate completions
+        # NOTE: This will only work when there is one video being analyzed at a time
         condition = self._extract_condition(
             model=model,
-            pixel_values_videos=pixel_values_videos,
+            pixel_values_videos=prompt_inputs['pixel_values'][:self.num_sampled_frames],
         )
         #breakpoint()
         with torch.no_grad():
             # Step 3: PG generates LoRA parameters
             pg_state_dict = self._build_pg_state_dict(condition)
             #breakpoint() # verified that dimensions align with llm
-            model.module.set_pg_state_dict(pg_state_dict)
+            model.set_pg_state_dict(pg_state_dict)
         #breakpoint()
         with unwrap_model_for_generation(model, self.accelerator) as unwrapped_model:
-            generate_returned_result = unwrapped_model.generate(
-                **{k: v for k, v in prompt_inputs.items() if k not in self.vlm_module.get_non_generate_params()}, 
-                generation_config=self.generation_config
-            )
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                generate_returned_result = unwrapped_model.generate(
+                    **{k: v for k, v in prompt_inputs.items() if k not in self.vlm_module.get_non_generate_params()}, 
+                    generation_config=self.generation_config
+                )
             prompt_length = prompt_ids.size(1)
             if not self.vlm_module.is_embeds_input():
                 prompt_completion_ids = generate_returned_result
@@ -726,7 +752,7 @@ class MyGRPOTrainer(Trainer):
                 # So the returned result of the `generate` method only contains the completion ids
                 completion_ids = generate_returned_result
                 prompt_completion_ids = torch.cat([prompt_ids, completion_ids], dim=1)
-        model.module.clear_pg_state_dict()
+        model.clear_pg_state_dict()
         #breakpoint()
         # Mask everything after the first EOS token
         is_eos = completion_ids == self.processing_class.eos_token_id
@@ -744,6 +770,7 @@ class MyGRPOTrainer(Trainer):
         with torch.no_grad():
             # When using num_iterations == 1, old_per_token_logps == per_token_logps, so we can skip its
             # computation here, and use per_token_logps.detach() instead.
+            # TODO: Support num iterations > 1 when generating parameters
             if self.num_iterations > 1:
                 old_per_token_logps = self._get_per_token_logps(
                     model, prompt_completion_ids, attention_mask, **multimodal_inputs
@@ -759,10 +786,10 @@ class MyGRPOTrainer(Trainer):
                     self.ref_model, prompt_completion_ids, attention_mask, **multimodal_inputs
                 )
             else:
-                with self.accelerator.unwrap_model(model).disable_adapter():
-                    ref_per_token_logps = self._get_per_token_logps(
-                        model, prompt_completion_ids, attention_mask, **multimodal_inputs
-                    )
+                ref_per_token_logps = self._get_per_token_logps(
+                    model, prompt_completion_ids, attention_mask, **multimodal_inputs
+                )
+        #breakpoint()
         if ref_per_token_logps is not None:
             ref_per_token_logps = ref_per_token_logps[:, prompt_length - 1:]
 
@@ -877,17 +904,22 @@ class MyGRPOTrainer(Trainer):
         attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
 
         # Get the current policy's log probabilities
-        # TODO: Ensure condition extraction work on the batch level
-        # TODO: also pay attention to OOM technically generated params are same for all pixel values
-        # since num generations is a multiple of forward batch size
-        # therefore repetition of extracted condition could suffice (or caching if time permits)
+        # pay attention to OOM technically generated params are same for all pixel values
+        # when number of generations is equal to forward batch size
+        # since all pixel values belong to same video (just repeated for each generation)
+        # NOTE: When forward batch size > num generations, we would incorrectly generating parameters only for first sample!
+        #breakpoint()
         condition = self._extract_condition(
             model=model,
-            pixel_values_videos=pixel_values_videos,
+            pixel_values_videos=multimodal_inputs["pixel_values"][:self.num_sampled_frames],
         )
+        #breakpoint()
         pg_state_dict = self._build_pg_state_dict(condition)
-        model.module.set_pg_state_dict(pg_state_dict)
+        #breakpoint()
+        model.set_pg_state_dict(pg_state_dict)
+        #breakpoint()
         per_token_logps = self._get_per_token_logps(model, input_ids, attention_mask, **multimodal_inputs)
+        #breakpoint()
         # Get rid of the prompt (-1 because of the shift done in get_per_token_logps)
         per_token_logps = per_token_logps[:, prompt_ids.size(1) - 1:]
 
@@ -932,9 +964,10 @@ class MyGRPOTrainer(Trainer):
         with torch.no_grad():
             #breakpoint()
             video_embeds = model.extract_feature(pixel_values_videos)
-            #video_embeds = torch.flatten(video_embeds, start_dim=0, end_dim=1)
+            #breakpoint()
+            video_embeds = torch.flatten(video_embeds, start_dim=0, end_dim=1)
         #breakpoint()
-        #condition = video_embeds.unsqueeze(0).unsqueeze(1) # B,1,T,D
+        condition = video_embeds.unsqueeze(0).unsqueeze(1) # B,1,T,D
         #breakpoint()
         return condition
 
@@ -944,14 +977,6 @@ class MyGRPOTrainer(Trainer):
             pg_output = self.parameter_generator(condition=condition)
         #breakpoint()
         return pg_output
-    
-    def _clip_grad_norm(self, model):
-        """Clip gradients to max_grad_norm. Returns the pre-clip gradient norm."""
-        #breakpoint()
-        return self.accelerator.clip_grad_norm_(
-            self.parameter_generator.parameters(), 
-            self.args.max_grad_norm
-        )
 
     def _save(self, output_dir: Optional[str] = None, state_dict=None):
         # If we are executing this function, we are the process zero, so we don't check for that.

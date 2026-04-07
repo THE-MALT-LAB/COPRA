@@ -311,6 +311,7 @@ def main(script_args, training_args, model_args):
         min_pixels=script_args.min_pixels,
         max_anyres_num=script_args.max_anyres_num,
         torch_dtype=model_args.torch_dtype,
+        num_sampled_frames=script_args.num_sampled_frames
     )
 
     # Train and push the model to the Hub

@@ -5,7 +5,7 @@ export PYTHONPATH="HY-WU/:VLM-R1/src/open-r1-multimodal/:$PYTHONPATH"
 RUN_NAME="InternVL2-8B-GRPO-VAD"
 export LOG_PATH="./debug_log_$RUN_NAME.txt"
 
-torchrun --nproc_per_node="1" \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True torchrun --nproc_per_node="1" \
     --nnodes="1" \
     --node_rank="0" \
     --master_addr="127.0.0.1" \
@@ -18,8 +18,8 @@ torchrun --nproc_per_node="1" \
     --freeze_vision_modules true \
     --max_anyres_num 1 \
     --num_iterations 1 \
-    --num_generations 4 \
-    --per_device_train_batch_size 4 \
+    --num_generations 3 \
+    --per_device_train_batch_size 3 \
     --gradient_accumulation_steps 1 \
     --logging_steps 1 \
     --bf16 \
@@ -32,4 +32,5 @@ torchrun --nproc_per_node="1" \
     --run_name $RUN_NAME \
     --save_steps 400 \
     --save_only_model true \
-    --beta 0.0
+    --beta 0.1 \
+    --max_grad_norm 1
