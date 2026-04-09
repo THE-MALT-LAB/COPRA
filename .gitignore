@@ -1,5 +1,13 @@
 env.txt
 salloc.sh
+ucf_crime
+wandb
+*.txt
+*.json
+scores_video_level_pg
+scores_baseline
+ckpt/
+xd_violence
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

@@ -189,8 +189,6 @@ class WeaklySupervisedVideoAnomalyDetectionDataset(Dataset):
         sorted_integers = np.sort(random_integers)
         frame_idx = sorted_integers.astype(int)
         frames = vr.get_batch(frame_idx).asnumpy()  # (8, H, W, 3)
-        # TODO: insert into inputs
-        sample_fps = max_num_frames / example['duration']
         #breakpoint()
         """ start, end = 0, vlen
         # Uniform sampling
