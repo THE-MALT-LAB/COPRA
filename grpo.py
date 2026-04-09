@@ -153,6 +153,7 @@ class WeaklySupervisedVideoAnomalyDetectionDataset(Dataset):
                         random.shuffle(cur_data_dict)
                         cur_data_dict = cur_data_dict[:sampling_number]
                     print(f"Loaded {len(cur_data_dict)} samples from {json_path}")
+                    random.shuffle(cur_data_dict)
                     self.list_data_dict.extend(cur_data_dict)
         else:
             raise ValueError(f"Unsupported file type: {data_path}")

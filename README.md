@@ -56,4 +56,4 @@ NOTE: VLM-R1 will NOT work with higher transformers version v4.57.1 (from HY-WU/
     - log generated parameter weight l2 norm with wandb over time
 - [x] added saving for parameter generator weights
 - [x] Check if GRPO with parameter generation leads to stable rewards/losses over training   
-- [] Add evaluation script from VERAS
+- [x] Add evaluation script from VERAS
