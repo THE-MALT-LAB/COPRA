@@ -56,7 +56,7 @@ Please ONLY reply according to this format, don't give me any other words."""
             torch_dtype=torch.bfloat16,
         )
         self.parameter_generator = ParameterGenerator(self.parameter_generator_config)
-        self.parameter_generator.load_state_dict( torch.load("/aiau001_scratch/dzj0055/HYWUVLM-R1/my_output/InternVL2-8B-GRPO-VAD-lr5e-7/pg_weights.bin") )
+        self.parameter_generator.load_state_dict( torch.load("ckpt/FINISHED/InternVL2-8B-GRPO-VAD/pg_weights.bin") )
         self.parameter_generator = self.parameter_generator.cuda()
         self.parameter_generator.eval()
         

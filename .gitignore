@@ -8,6 +8,7 @@ scores_video_level_pg
 scores_baseline
 ckpt/
 xd_violence
+scores_video_level_pg_xd
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

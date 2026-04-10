@@ -179,7 +179,12 @@ class WeaklySupervisedVideoAnomalyDetectionDataset(Dataset):
         
         video_path = os.path.join(self.data_root, example['video'])
         # Load video inputs here
-        vr = decord.VideoReader(video_path, ctx=decord.cpu(0))
+        try:
+            vr = decord.VideoReader(video_path, ctx=decord.cpu(0))
+        except Exception as e:
+            new_idx = random.randint( 0, len(self.list_data_dict) - 1 )
+            print(f"Cannot read {video_path}: {e}\nSampling {new_idx}!")
+            return self.__getitem__( new_idx )
         total_frames = len(vr)
         # Sample 8 evenly spaced frame indices using VERA code
         start_frame = 0
