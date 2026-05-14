@@ -39,6 +39,26 @@ cd HY-WU/
 pip install -r requirements.txt
 ```
 
+## Evaluation
+
+Please download **UCF-Crime** and **XD-Violence** from the official author mirrors. After downloading, create symbolic links to the dataset directories inside this repository so the evaluation scripts can find them consistently.
+
+### UCF-Crime
+
+To evaluate on UCF-Crime, run:
+
+```bash
+sh eval_vid_level.sh
+```
+
+### XD-Violence
+
+To evaluate on XD-Violence, run:
+
+```bash
+sh eval_vid_level_xd.sh
+```
+
 ## TODO
 
 - [x] Update VideoChat-R1.5 to utilize UCF-Crime frames and annotations
