@@ -780,6 +780,16 @@ def fetch_clip(ele: dict, duration: float, client = None, image_factor: int = IM
             logger.warning(f"The given max_pixels[{max_pixels_supposed}] exceeds limit[{max_pixels}].")
         max_pixels = min(max_pixels_supposed, max_pixels)
 
+        #breakpoint()
+        video = transforms.functional.resize(
+            video,
+            [240, 320], # Conformity with UCF-Crime
+            interpolation=InterpolationMode.BICUBIC,
+            antialias=True,
+        ).float()
+        height = 240
+        width = 320
+        #breakpoint()
         if "resized_height" in ele and "resized_width" in ele:
             resized_height, resized_width = smart_resize(
                 ele["resized_height"],
@@ -944,6 +954,15 @@ def fetch_clip_batch(
         )
         max_pixels = min(ele.get("max_pixels", max_pixels), max_pixels)
 
+        #breakpoint()
+        video = transforms.functional.resize(
+            video,
+            [240, 320], # Conformity with UCF-Crime,
+            interpolation=InterpolationMode.BICUBIC,
+            antialias=True,
+        )
+        height = 240
+        width = 320
         resized_height, resized_width = smart_resize(
             height, width,
             factor=image_factor,
