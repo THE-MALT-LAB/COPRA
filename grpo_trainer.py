@@ -277,29 +277,59 @@ class MyGRPOTrainer(Trainer):
         model_cls = self.vlm_module.get_model_class(model_id, model_init_kwargs)
         # Add parameter generator here
         #breakpoint()
-        self.parameter_generator_config = ParameterGeneratorConfig(
-            token_dim=512,
-            rank=8, # 16 OOM
-            alpha=16, # 2x rank
-            input_dim=4096,
-            dim_accumulation=4,
-            d_model=512,
-            head_dim=512,
-            num_base_model_layers=32,
-            output_dim=4096,
-            num_pg_layers=16,
-            prefix="language_model.model.layers.",
-            pg_mapping={
-                # wqkv is fused QKV: in=4096, out=6144 (q=4096, k=1024, v=1024)
-                "attention.wqkv": {"lora_A_dim": 4096, "lora_B_dim": 6144},
-                "attention.wo":   {"lora_A_dim": 4096, "lora_B_dim": 4096},
-                # MLP: w1 and w3 are gate/up, w2 is down
-                "feed_forward.w1": {"lora_A_dim": 4096,  "lora_B_dim": 14336},
-                "feed_forward.w3": {"lora_A_dim": 4096,  "lora_B_dim": 14336},
-                "feed_forward.w2": {"lora_A_dim": 14336, "lora_B_dim": 4096},
-            },
-            torch_dtype=torch.bfloat16,
-        )
+        assert 'InternVL' in model_id
+        if 'InternVL2' in model_id:
+            self.parameter_generator_config = ParameterGeneratorConfig(
+                token_dim=512,
+                rank=8, # 16 OOM
+                alpha=16, # 2x rank
+                input_dim=4096,
+                dim_accumulation=4,
+                d_model=512,
+                head_dim=512,
+                num_base_model_layers=32,
+                output_dim=4096,
+                num_pg_layers=16,
+                prefix="language_model.model.layers.",
+                pg_mapping={
+                    # wqkv is fused QKV: in=4096, out=6144 (q=4096, k=1024, v=1024)
+                    "attention.wqkv": {"lora_A_dim": 4096, "lora_B_dim": 6144},
+                    "attention.wo":   {"lora_A_dim": 4096, "lora_B_dim": 4096},
+                    # MLP: w1 and w3 are gate/up, w2 is down
+                    "feed_forward.w1": {"lora_A_dim": 4096,  "lora_B_dim": 14336},
+                    "feed_forward.w3": {"lora_A_dim": 4096,  "lora_B_dim": 14336},
+                    "feed_forward.w2": {"lora_A_dim": 14336, "lora_B_dim": 4096},
+                },
+                torch_dtype=torch.bfloat16,
+            )
+        elif 'InternVL3' in model_id:
+            self.parameter_generator_config = ParameterGeneratorConfig(
+                token_dim=512,
+                rank=8, # 16 OOM
+                alpha=16, # 2x rank
+                input_dim=3584,
+                dim_accumulation=4,
+                d_model=512,
+                head_dim=512,
+                num_base_model_layers=28,
+                output_dim=3584,
+                num_pg_layers=14,
+                prefix="language_model.model.layers.",
+                # more similar to qwen2.5vl
+                pg_mapping={
+                    "self_attn.q_proj": {"lora_A_dim": 3584, "lora_B_dim": 3584},
+                    "self_attn.k_proj": {"lora_A_dim": 3584, "lora_B_dim": 512},
+                    "self_attn.v_proj": {"lora_A_dim": 3584, "lora_B_dim": 512},
+                    "self_attn.o_proj": {"lora_A_dim": 3584, "lora_B_dim": 3584},
+                    # MLP: w1 and w3 are gate/up, w2 is down
+                    "mlp.gate_proj": {"lora_A_dim": 3584, "lora_B_dim": 18944},
+                    "mlp.up_proj": {"lora_A_dim": 3584, "lora_B_dim": 18944},
+                    "mlp.down_proj": {"lora_A_dim": 18944, "lora_B_dim": 3584},
+                },
+                torch_dtype=torch.bfloat16,
+            )
+        else:
+            raise ValueError("Only support finetuning InternVL2 and VL3!")
         self.parameter_generator = ParameterGenerator(self.parameter_generator_config)
         self.parameter_generator.train()
         if not args.resume_from_checkpoint:
