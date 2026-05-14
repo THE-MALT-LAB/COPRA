@@ -185,6 +185,7 @@ class VideoAnomalyDetectionModelInference(pl.LightningModule):
             }]
         }
 
+    @torch.no_grad
     def forward(self, video_path: str, start_frame: int, end_frame: int,
                 all_snippet_info: list[dict], batch_size: int = 8, batch_idx=0):
         filename = video_path.split('/')[-1].lower()

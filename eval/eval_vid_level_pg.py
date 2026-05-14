@@ -188,6 +188,7 @@ class VideoAnomalyDetectionModelInference(pl.LightningModule):
             }]
         }
 
+    @torch.no_grad
     def inject_parameters(self, video_path: str, start_frame: int, end_frame: int):
         # Format into conversation
 
