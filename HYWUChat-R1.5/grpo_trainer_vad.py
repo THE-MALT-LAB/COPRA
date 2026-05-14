@@ -1,0 +1,973 @@
+# Copyright 2025 The HuggingFace Team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import os
+import textwrap
+from collections import defaultdict
+from typing import Any, Callable, Optional, Union
+import contextlib 
+
+import torch
+import torch.utils.data
+import transformers
+from datasets import Dataset, IterableDataset
+from packaging import version
+from transformers import (
+    AriaForConditionalGeneration,
+    AriaProcessor,
+    AutoModelForCausalLM,
+    AutoModelForSequenceClassification,
+    AutoProcessor,
+    AutoTokenizer,
+    GenerationConfig,
+    PreTrainedModel,
+    PreTrainedTokenizerBase,
+    Qwen2VLForConditionalGeneration,
+    Qwen2_5_VLForConditionalGeneration,
+    Trainer,
+    TrainerCallback,
+    is_wandb_available,
+)
+from transformers.integrations.deepspeed import is_deepspeed_zero3_enabled
+from transformers.utils import is_peft_available
+
+from trl.data_utils import apply_chat_template, is_conversational, maybe_apply_chat_template
+from trl.models import create_reference_model, prepare_deepspeed, unwrap_model_for_generation
+from trl.trainer.grpo_config import GRPOConfig
+from trl.trainer.utils import generate_model_card, get_comet_experiment_url
+from torch.utils.data.sampler import RandomSampler
+import copy
+import math
+from my_vision_process import process_vision_info
+
+if is_peft_available():
+    from peft import PeftConfig, get_peft_model
+
+if is_wandb_available():
+    import wandb
+
+from wu.config import ParameterGeneratorConfig
+from wu.generator import ParameterGenerator
+from wu.mixin import inject_pg
+
+# What we call a reward function is a callable that takes a list of prompts and completions and returns a list of
+# rewards. When it's a string, it's a model ID, so it's loaded as a pretrained model.
+RewardFunc = Union[str, PreTrainedModel, Callable[[list, list], list[float]]]
+
+
+import random
+class BatchSchedulerSampler(torch.utils.data.sampler.Sampler):
+    """
+    Iterate over tasks and provide a random batch per task in each mini-batch,
+    ensuring that each sample from a dataset is only sampled once per epoch.
+    Sampling is done based on the remaining number of samples in each dataset.
+    """
+    def __init__(self, dataset, batch_size):
+        # import pdb; pdb.set_trace()
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.number_of_datasets = len(dataset.datasets)
+        self.dataset_sizes = [len(cur_dataset) for cur_dataset in dataset.datasets]
+        self.cumulative_sizes = dataset.cumulative_sizes  # Used to map indices to global positions
+        self.remaining_samples = self.dataset_sizes[:]  # Track remaining samples for each dataset
+
+    def __len__(self):
+        # Total number of samples across all datasets
+        return sum(self.dataset_sizes)
+
+    def __iter__(self):
+        samplers_list = []
+        sampler_iterators = []
+
+        # Create RandomSamplers and their iterators for each dataset
+        for dataset_idx in range(self.number_of_datasets):
+            cur_dataset = self.dataset.datasets[dataset_idx]
+            sampler = RandomSampler(cur_dataset)
+            samplers_list.append(sampler)
+            sampler_iterators.append(iter(sampler))
+
+        final_samples_list = []  # This will store the global indices of the combined dataset
+
+        # Iterate until all datasets are exhausted
+        while True:
+            # Calculate the probability of sampling from each dataset
+            total_remaining = sum(self.remaining_samples)
+            if total_remaining == 0:
+                break  # All datasets are exhausted
+
+            # Normalize remaining samples to get probabilities
+            probabilities = [remaining / total_remaining for remaining in self.remaining_samples]
+
+            # Select a dataset based on the probabilities
+            selected_dataset_idx = random.choices(range(self.number_of_datasets), weights=probabilities, k=1)[0]
+
+            # Try to get a batch of samples from the selected dataset
+            cur_sampler_iterator = sampler_iterators[selected_dataset_idx]
+
+            try:
+                # import pdb; pdb.set_trace()
+                cur_samples = []
+                for _ in range(min(self.batch_size, self.remaining_samples[selected_dataset_idx])):
+                    cur_sample_org = next(cur_sampler_iterator)
+                    if selected_dataset_idx == 0:
+                        cur_sample = cur_sample_org
+                    else:
+                        cur_sample = cur_sample_org - self.cumulative_sizes[selected_dataset_idx-1] 
+                    cur_samples.append(cur_sample)
+                    self.remaining_samples[selected_dataset_idx] -= 1  # Decrement remaining samples
+                final_samples_list.extend(cur_samples)
+            except StopIteration:
+                # If the iterator is exhausted, set remaining samples to 0 for this dataset
+                self.remaining_samples[selected_dataset_idx] = 0
+
+        # import pdb; pdb.set_trace()
+        return iter(final_samples_list)
+
+class Qwen2VLGRPOTrainer_Video_VAD(Trainer):
+    """
+    Trainer for the Group Relative Policy Optimization (GRPO) method. This algorithm was initially proposed in the
+    paper [DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models](https://huggingface.co/papers/2402.03300).
+
+    Example:
+
+    ```python
+    from datasets import load_dataset
+    from trl import GRPOTrainer
+
+    dataset = load_dataset("trl-lib/tldr", split="train")
+
+    trainer = GRPOTrainer(
+        model="Qwen/Qwen2-0.5B-Instruct",
+        reward_funcs="weqweasdas/RM-Gemma-2B",
+        train_dataset=dataset,
+    )
+
+    trainer.train()
+    ```
+
+    Args:
+        model (`Union[str, PreTrainedModel]`):
+            Model to be trained. Can be either:
+
+            - A string, being the *model id* of a pretrained model hosted inside a model repo on huggingface.co, or
+              a path to a *directory* containing model weights saved using
+              [`~transformers.PreTrainedModel.save_pretrained`], e.g., `'./my_model_directory/'`. The model is
+              loaded using [`~transformers.AutoModelForCausalLM.from_pretrained`] with the keywork arguments
+              in `args.model_init_kwargs`.
+            - A [`~transformers.PreTrainedModel`] object. Only causal language models are supported.
+        reward_funcs (`Union[RewardFunc, list[RewardFunc]]`):
+            Reward functions to be used for computing the rewards. To compute the rewards, we call all the reward
+            functions with the prompts and completions and sum the rewards. Can be either:
+
+            - A single reward function, such as:
+                - A string: The *model ID* of a pretrained model hosted inside a model repo on huggingface.co, or a
+                path to a *directory* containing model weights saved using
+                [`~transformers.PreTrainedModel.save_pretrained`], e.g., `'./my_model_directory/'`. The model is loaded
+                using [`~transformers.AutoModelForSequenceClassification.from_pretrained`] with `num_labels=1` and the
+                keyword arguments in `args.model_init_kwargs`.
+                - A [`~transformers.PreTrainedModel`] object: Only sequence classification models are supported.
+                - A custom reward function: The function is provided with the prompts and the generated completions,
+                  plus any additional columns in the dataset. It should return a list of rewards. For more details, see
+                  [Using a custom reward function](#using-a-custom-reward-function).
+            - A list of reward functions, where each item can independently be any of the above types. Mixing different
+            types within the list (e.g., a string model ID and a custom reward function) is allowed.
+        args ([`GRPOConfig`], *optional*, defaults to `None`):
+            Configuration for this trainer. If `None`, a default configuration is used.
+        train_dataset ([`~datasets.Dataset`] or [`~datasets.IterableDataset`]):
+            Dataset to use for training. It must include a column `"prompt"`. Any additional columns in the dataset is
+            ignored. The format of the samples can be either:
+
+            - [Standard](dataset_formats#standard): Each sample contains plain text.
+            - [Conversational](dataset_formats#conversational): Each sample contains structured messages (e.g., role
+              and content).
+        eval_dataset ([`~datasets.Dataset`], [`~datasets.IterableDataset`] or `dict[str, Union[Dataset, IterableDataset]]`):
+            Dataset to use for evaluation. It must meet the same requirements as `train_dataset`.
+        processing_class ([`~transformers.PreTrainedTokenizerBase`], *optional*, defaults to `None`):
+            Processing class used to process the data. The padding side must be set to "left". If `None`, the
+            processing class is loaded from the model's name with [`~transformers.AutoTokenizer.from_pretrained`].
+        reward_processing_classes (`Union[PreTrainedTokenizerBase, list[PreTrainedTokenizerBase]]`, *optional*, defaults to `None`):
+            Processing classes corresponding to the reward functions specified in `reward_funcs`. Can be either:
+
+            - A single processing class: Used when `reward_funcs` contains only one reward function.
+            - A list of processing classes: Must match the order and length of the reward functions in `reward_funcs`.
+            If set to `None`, or if an element of the list corresponding to a [`~transformers.PreTrainedModel`] is
+            `None`, the tokenizer for the model is automatically loaded using [`~transformers.AutoTokenizer.from_pretrained`].
+            For elements in `reward_funcs` that are custom reward functions (not [`~transformers.PreTrainedModel`]),
+            the corresponding entries in `reward_processing_classes` are ignored.
+        callbacks (list of [`~transformers.TrainerCallback`], *optional*, defaults to `None`):
+            List of callbacks to customize the training loop. Will add those to the list of default callbacks
+            detailed in [here](https://huggingface.co/docs/transformers/main_classes/callback).
+
+            If you want to remove one of the default callbacks used, use the [`~transformers.Trainer.remove_callback`]
+            method.
+        optimizers (`tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LambdaLR]`, *optional*, defaults to `(None, None)`):
+            A tuple containing the optimizer and the scheduler to use. Will default to an instance of [`AdamW`] on your
+            model and a scheduler given by [`get_linear_schedule_with_warmup`] controlled by `args`.
+        peft_config ([`~peft.PeftConfig`], *optional*, defaults to `None`):
+            PEFT configuration used to wrap the model. If `None`, the model is not wrapped.
+    """
+
+    SYSTEM_PROMPT = """You are the model.
+** Model Description: **
+You are designed to do binary classification. The input is a sequence of video frames for identifying whether there is an anomaly in the video; you need to output the class label, i.e., an integer in the set {0, 1}. 0 represents normal video, and 1 represents abnormal video. Please answer the prompt questions.
+** Prompt Questions: **
+Answer the following questions based on what you see from the video frames and provide an explanation in one sentence. 
+Based on the analysis above, please conclude your answer to 'Is there any anomaly in the video?' in 'Yes, there is an anomaly' or 'No, there is no anomaly'.
+Please give your output strictly in the following format:
+```
+<think>[Add your reasoning here]</think>
+<answer>[ONLY the integer class label; make necessary assumptions if needed]</answer>
+```
+Please ONLY reply according to this format, don't give me any other words."""
+
+    def __init__(
+        self,
+        model: Union[str, PreTrainedModel],
+        reward_funcs: Union[RewardFunc, dict[str, RewardFunc]],
+        args: GRPOConfig = None,
+        train_dataset: Optional[Union[Dataset, IterableDataset]] = None,
+        eval_dataset: Optional[Union[Dataset, IterableDataset, dict[str, Union[Dataset, IterableDataset]]]] = None,
+        processing_class: Optional[PreTrainedTokenizerBase] = None,
+        reward_processing_classes: Optional[Union[PreTrainedTokenizerBase, list[PreTrainedTokenizerBase]]] = None,
+        callbacks: Optional[list[TrainerCallback]] = None,
+        optimizers: tuple[Optional[torch.optim.Optimizer], Optional[torch.optim.lr_scheduler.LambdaLR]] = (None, None),
+        peft_config: Optional["PeftConfig"] = None,
+        max_pixels: Optional[int] = 12845056,
+        min_pixels: Optional[int] = 3136,
+        attn_implementation: str = "flash_attention_2",
+    ):
+        # Args
+        if args is None:
+            model_name = model if isinstance(model, str) else model.config._name_or_path
+            model_name = model_name.split("/")[-1]
+            args = GRPOConfig(f"{model_name}-GRPO")
+
+        # Models
+        # Trained model
+        model_init_kwargs = args.model_init_kwargs or {}
+        model_init_kwargs["attn_implementation"] = attn_implementation
+
+        if isinstance(model, str):
+            model_id = model
+            torch_dtype = model_init_kwargs.get("torch_dtype")
+            if isinstance(torch_dtype, torch.dtype) or torch_dtype == "auto" or torch_dtype is None:
+                pass  # torch_dtype is already a torch.dtype or "auto" or None
+            elif isinstance(torch_dtype, str):  # it's a str, but not "auto"
+                torch_dtype = getattr(torch, torch_dtype)
+                model_init_kwargs["torch_dtype"] = torch_dtype
+            else:
+                raise ValueError(
+                    "Invalid `torch_dtype` passed to `GRPOConfig`. Expected either 'auto' or a string representing "
+                    f"a `torch.dtype` (e.g., 'float32'), but got {torch_dtype}."
+                )
+            # Disable caching if gradient checkpointing is enabled (not supported)
+            model_init_kwargs["use_cache"] = (
+                False if args.gradient_checkpointing else model_init_kwargs.get("use_cache")
+            )
+            if "Qwen2-VL" in model_id:
+                model_init_kwargs["torch_dtype"] = torch.bfloat16
+                model_init_kwargs["attn_implementation"] = "flash_attention_2"
+                # TODO: Make this work for more backbones
+                self.parameter_generator_config = ParameterGeneratorConfig(
+                    token_dim=512,
+                    rank=8, # 16 OOM
+                    alpha=16, # 2x rank
+                    input_dim=3584,
+                    dim_accumulation=4,
+                    d_model=512,
+                    head_dim=512,
+                    num_base_model_layers=28,
+                    output_dim=3584,
+                    num_pg_layers=14,
+                    prefix="model.language_model.layers.",
+                    pg_mapping={
+                        "self_attn.q_proj": {"lora_A_dim": 3584, "lora_B_dim": 3584},
+                        "self_attn.k_proj": {"lora_A_dim": 3584, "lora_B_dim": 512},
+                        "self_attn.v_proj": {"lora_A_dim": 3584, "lora_B_dim": 512},
+                        "self_attn.o_proj": {"lora_A_dim": 3584, "lora_B_dim": 3584},
+                        "mlp.gate_proj": {"lora_A_dim": 3584, "lora_B_dim": 18944},
+                        "mlp.up_proj": {"lora_A_dim": 3584, "lora_B_dim": 18944},
+                        "mlp.down_proj": {"lora_A_dim": 18944, "lora_B_dim": 3584},
+                    },
+                    torch_dtype=torch.bfloat16,
+                )
+                self.parameter_generator = ParameterGenerator(self.parameter_generator_config)
+                self.parameter_generator.train()
+                if not args.resume_from_checkpoint:
+                    # Initialize LoRA B Projection with close to zeros to match HY-WU paper
+                    # close to because otherwise optimization is slow
+                    torch.nn.init.zeros_( self.parameter_generator.model.proj_out_B.bias )
+                    torch.nn.init.zeros_( self.parameter_generator.model.proj_out_B.weight )
+                #model = Qwen2VLForConditionalGeneration.from_pretrained(model, **model_init_kwargs)
+                model: Qwen2VLForConditionalGeneration = inject_pg(
+                    self.parameter_generator.config, Qwen2VLForConditionalGeneration
+                ).from_pretrained(model, **model_init_kwargs)
+                #model.eval()
+                for param in model.model.parameters():
+                    # Saves memory! gradients will still backprop to parameter generator
+                    # source: https://discuss.pytorch.org/t/grad-through-frozen-weights/84672/3
+                    param.requires_grad = False
+                model.enable_pg()
+            elif "Qwen2.5-VL" in model_id:
+                #breakpoint()
+                model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                    model, 
+                    torch_dtype=torch.bfloat16,
+                    use_sliding_window=True,
+                    **model_init_kwargs
+                    )
+            elif "Aria" in model_id:
+                model_init_kwargs.pop("use_cache")
+                model = AriaForConditionalGeneration.from_pretrained(model, **model_init_kwargs)
+            else:
+                model = AutoModelForCausalLM.from_pretrained(model, **model_init_kwargs)
+        else:
+            model_id = model.config._name_or_path
+            if args.model_init_kwargs is not None:
+                raise ValueError(
+                    "You passed `model_init_kwargs` to the `GRPOConfig`, but your model is already instantiated. "
+                    "This argument can only be used when the `model` argument is a string."
+                )
+
+        if peft_config is not None:
+            model = get_peft_model(model, peft_config)
+
+        # Reference model
+        if is_deepspeed_zero3_enabled():
+            if "Qwen2-VL" in model_id:
+                self.ref_model = Qwen2VLForConditionalGeneration.from_pretrained(model_id, **model_init_kwargs)
+            elif "Qwen2.5-VL" in model_id:
+                self.ref_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                    model_id, 
+                    torch_dtype=torch.bfloat16,
+                    use_sliding_window=True,
+                    **model_init_kwargs
+                    )
+            elif "Aria" in model_id:
+                self.ref_model = AriaForConditionalGeneration.from_pretrained(model_id, **model_init_kwargs)
+            else:
+                self.ref_model = AutoModelForCausalLM.from_pretrained(model_id, **model_init_kwargs)
+        elif peft_config is None:
+            # If PEFT configuration is not provided, create a reference model based on the initial model.
+            self.ref_model = create_reference_model(model)
+        else:
+            # If PEFT is used, the reference model is not needed since the adapter can be disabled
+            # to revert to the initial model.
+            self.ref_model = None
+
+        # Processing class
+        if processing_class is None:
+            if "Qwen2-VL" in model_id or "Qwen2.5-VL" in model_id or "Aria" in model_id:
+                processing_class = AutoProcessor.from_pretrained(model_id)
+                pad_token_id = processing_class.tokenizer.pad_token_id
+                processing_class.pad_token_id = pad_token_id
+                processing_class.eos_token_id = processing_class.tokenizer.eos_token_id
+                if "Qwen" in model_id or "Qwen2.5-VL" in model_id:
+                    processing_class.image_processor.max_pixels = max_pixels
+                    processing_class.image_processor.min_pixels = min_pixels
+            else:
+                processing_class = AutoTokenizer.from_pretrained(model.config._name_or_path, padding_side="left")
+                pad_token_id = processing_class.pad_token_id
+
+        # Reward functions
+        # reward_funcs
+        for key in reward_funcs:
+            for i, reward_func in enumerate(reward_funcs[key]):
+                if isinstance(reward_func, str):
+                    reward_funcs[key][i] = AutoModelForSequenceClassification.from_pretrained(
+                        reward_func, num_labels=1, **model_init_kwargs
+                    )
+
+        # for i, reward_func in enumerate(reward_funcs):
+        #     if isinstance(reward_func, str):
+        #         reward_funcs[i] = AutoModelForSequenceClassification.from_pretrained(
+        #             reward_func, num_labels=1, **model_init_kwargs
+        #         )
+        self.reward_funcs = reward_funcs
+
+        # Reward processing class
+        if reward_processing_classes is None:
+            # import pdb;pdb.set_trace()
+            # reward_processing_classes = [None] * len(reward_funcs)
+            reward_processing_classes = {}
+            for key in reward_funcs:
+                # import pdb;pdb.set_trace()
+                # for i, reward_func in enumerate(reward_funcs[key]):
+                reward_processing_classes[key] = [None] * len(reward_funcs[key])
+        else:
+            raise ValueError("The number of reward processing classes must match the number of reward functions.")
+
+        for key in reward_processing_classes:
+            for i, (reward_processing_class, reward_func) in enumerate(zip(reward_processing_classes[key], reward_funcs[key])):
+                if isinstance(reward_func, PreTrainedModel):
+                    if reward_processing_class is None:
+                        reward_processing_class = AutoTokenizer.from_pretrained(reward_func.config._name_or_path)
+                    if reward_processing_class.pad_token_id is None:
+                        reward_processing_class.pad_token = reward_processing_class.eos_token
+                    # The reward model computes the reward for the latest non-padded token in the input sequence.
+                    # So it's important to set the pad token ID to the padding token ID of the processing class.
+                    reward_func.config.pad_token_id = reward_processing_class.pad_token_id
+                    reward_processing_classes[key][i] = reward_processing_class
+        self.reward_processing_classes = reward_processing_classes
+
+        # Data collator
+        def data_collator(features):  # No data collation is needed in GRPO
+            # import pdb; pdb.set_trace()
+            return features
+
+        # Training arguments
+        self.max_prompt_length = args.max_prompt_length
+        self.max_completion_length = args.max_completion_length  # = |o_i| in the GRPO paper
+        print(self.max_completion_length)
+        self.num_generations = args.num_generations  # = G in the GRPO paper
+        self.generation_config = GenerationConfig(
+            max_new_tokens=self.max_completion_length,
+            do_sample=True,  
+            temperature=1, # HACK
+            num_return_sequences=self.num_generations,
+            pad_token_id=pad_token_id,
+        )
+        self.beta = args.beta
+
+        # The trainer estimates the number of FLOPs (floating-point operations) using the number of elements in the
+        # input tensor associated with the key "input_ids". However, in GRPO, the sampled data does not include the
+        # "input_ids" key. Instead, the available keys is "prompt". As a result, the trainer issues the warning:
+        # "Could not estimate the number of tokens of the input, floating-point operations will not be computed." To
+        # suppress this warning, we set the "estimate_tokens" key in the model's "warnings_issued" dictionary to True.
+        # This acts as a flag to indicate that the warning has already been issued.
+        model.warnings_issued["estimate_tokens"] = True
+
+        # Initialize the metrics
+        self._metrics = defaultdict(list)
+
+        super().__init__(
+            model=model,
+            args=args,
+            data_collator=data_collator,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
+            processing_class=processing_class,
+            callbacks=callbacks,
+            optimizers=optimizers,
+        )
+        
+        self.accelerator.prepare( self.parameter_generator )
+        #self.dummy_tensor_2 = torch.ones(1, requires_grad=True, device=self.parameter_generator.device)
+
+        # Gradient accumulation requires scaled loss. Normally, loss scaling in the parent class depends on whether the
+        # model accepts loss-related kwargs. Since we compute our own loss, this check is irrelevant. We set
+        # self.model_accepts_loss_kwargs to False to enable scaling.
+        self.model_accepts_loss_kwargs = False
+
+        if self.ref_model is not None:
+            if self.is_deepspeed_enabled:
+                self.ref_model = prepare_deepspeed(self.ref_model, self.accelerator)
+            else:
+                self.ref_model = self.accelerator.prepare_model(self.ref_model, evaluation_mode=True)
+
+        for key in self.reward_funcs:
+            for i, reward_func in enumerate(self.reward_funcs[key]):
+                if isinstance(reward_func, PreTrainedModel):
+                    self.reward_funcs[key][i] = self.accelerator.prepare_model(reward_func, evaluation_mode=True)
+
+
+    def create_optimizer(self):
+        """ Adapted from transformers source.
+        Setup the optimizer.
+
+        We provide a reasonable default that works well. If you want to use something else, you can pass a tuple in the
+        Trainer's init through `optimizers`, or subclass and override this method in a subclass.
+        """
+        # DO NOT USE WITH SAGEMAKER. UNTESTED!
+        #assert not is_sagemaker_mp_enabled()
+        opt_model = self.parameter_generator
+
+        if self.optimizer is None:
+            decay_parameters = self.get_decay_parameter_names(opt_model)
+            optimizer_grouped_parameters = [
+                {
+                    "params": [
+                        p for n, p in opt_model.named_parameters() if (n in decay_parameters and p.requires_grad)
+                    ],
+                    "weight_decay": self.args.weight_decay,
+                },
+                {
+                    "params": [
+                        p for n, p in opt_model.named_parameters() if (n not in decay_parameters and p.requires_grad)
+                    ],
+                    "weight_decay": 0.0,
+                },
+            ]
+
+            if self.optimizer_cls_and_kwargs is not None:
+                optimizer_cls, optimizer_kwargs = self.optimizer_cls_and_kwargs
+            else:
+                optimizer_cls, optimizer_kwargs = self.get_optimizer_cls_and_kwargs(self.args, opt_model)
+
+            # Overwrite `params` in case it's created by `get_optimizer_cls_and_kwargs`
+            # e.g. for GaLore optimizer.
+            if "params" in optimizer_kwargs:
+                optimizer_grouped_parameters = optimizer_kwargs.pop("params")
+
+            # Overwrite `model` in case it's created by `get_optimizer_cls_and_kwargs`
+            # e.g. for LOMO optimizer.
+            if "model" in optimizer_kwargs:
+                optimizer_grouped_parameters = optimizer_kwargs.pop("model")
+
+            # For layer-wise dummy optimizers we overwrite optimizer_grouped_parameters with `optimizer_dict`
+            # to avoid arguments conflicts.
+            if "optimizer_dict" in optimizer_kwargs:
+                optimizer_grouped_parameters = optimizer_kwargs.pop("optimizer_dict")
+
+            self.optimizer = optimizer_cls(optimizer_grouped_parameters, **optimizer_kwargs)
+            #breakpoint()
+
+            if "bitsandbytes" in str(optimizer_cls) and optimizer_kwargs.get("optim_bits", None) == 8:
+                import bitsandbytes
+
+                manager = bitsandbytes.optim.GlobalOptimManager.get_instance()
+
+                skipped = 0
+                for module in opt_model.modules():
+                    if isinstance(module, nn.Embedding):
+                        skipped += sum({p.data_ptr(): p.numel() for p in module.parameters()}.values())
+                        logger.info(f"skipped {module}: {skipped / 2**20}M params")
+                        manager.register_module_override(module, "weight", {"optim_bits": 32})
+                        logger.debug(f"bitsandbytes: will optimize {module} in fp32")
+                logger.info(f"skipped: {skipped / 2**20}M params")
+
+        return self.optimizer
+
+    def _get_train_sampler(self, dataset) -> Optional[torch.utils.data.Sampler]:
+        # import pdb; pdb.set_trace()
+        # dataset ignored just for compat with transformers v4.57.1
+        return BatchSchedulerSampler(self.train_dataset, int(os.environ["WORLD_SIZE"]) * self.args.per_device_train_batch_size * self.args.gradient_accumulation_steps)
+        
+        
+    def _set_signature_columns_if_needed(self):
+        # If `self.args.remove_unused_columns` is True, non-signature columns are removed.
+        # By default, this method sets `self._signature_columns` to the model's expected inputs.
+        # In GRPOTrainer, we preprocess data, so using the model's signature columns doesn't work.
+        # Instead, we set them to the columns expected by the `training_step` method, hence the override.
+        if self._signature_columns is None:
+            self._signature_columns = ["prompt"]
+
+
+    # Get the per-token log probabilities for the completions for the model and the reference model
+    def _get_per_token_logps(self, model, input_ids, attention_mask, pixel_values_videos=None, video_grid_thw=None, pixel_values=None, image_grid_thw=None):
+        logits = model(input_ids, attention_mask=attention_mask, pixel_values_videos=pixel_values_videos, video_grid_thw=video_grid_thw, pixel_values=pixel_values, image_grid_thw=image_grid_thw).logits  # (B, L, V)
+        logits = logits[:, :-1, :]  # (B, L-1, V), exclude the last logit: it corresponds to the next token pred
+        input_ids = input_ids[:, 1:]  # (B, L-1), exclude the first input ID since we don't have logits for it
+        # Compute the log probabilities for the input tokens. Use a loop to reduce memory peak.
+        per_token_logps = []
+        for logits_row, input_ids_row in zip(logits, input_ids):
+            log_probs = logits_row.log_softmax(dim=-1)
+            token_log_prob = torch.gather(log_probs, dim=1, index=input_ids_row.unsqueeze(1)).squeeze(1)
+            per_token_logps.append(token_log_prob)
+        return torch.stack(per_token_logps)
+
+
+    # Trainer "prepares" the inputs before calling `compute_loss`. It converts to tensor and move to device.
+    # Since we preprocess the data in `compute_loss`, we need to override this method to skip this step.
+    def _prepare_inputs(self, inputs: dict[str, Union[torch.Tensor, Any]]) -> dict[str, Union[torch.Tensor, Any]]:
+        return inputs
+
+    def make_conversation_video(self, example):
+        # if example['data_type'] == 'gqa':
+        #     example_prompt = QUESTION_TEMPLATE_GQA.replace("[QUESTION]", example["problem"]["question"])
+        #     example_prompt = example_prompt.replace("[OPTION]", str(example["problem"]["options"]))
+        # # print(example_prompt)
+        # elif example['data_type'] == 'tg':
+        #     example_prompt = QUESTION_TEMPLATE_TG.replace("[EVENT]", example["problem"])
+        # elif example['data_type'] == 'tracking':
+        #     example_prompt = QUESTION_TEMPLATE_TRACK.replace("[OBJECT]", example["problem"]["object"])
+        #     example_prompt = example_prompt.replace("[START]", str(example["problem"]["start"]))
+        
+        example_prompt = self.SYSTEM_PROMPT
+        #example_prompt = example_prompt.replace("[QUESTION]", example["problem"]["question"])
+        if 'options' in example["problem"]:
+            example_prompt = example_prompt.replace("[OPTION]", str(example["problem"]["options"]))
+        if 'video_path' in example:
+             
+            return [
+                    # {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": [
+                            {
+                                "type": "video", 
+                                "video": example["video_path"], 
+                                "total_pixels": 3584 * 28 * 28, 
+                                "min_pixels": 16 * 28 * 28,
+                            },
+                            {"type": "text", "text": example_prompt}
+                        ]
+                    },
+                ]
+        else:
+            return [
+                    # {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": [
+                            {"type": "image", 
+                                "image": example["image_path"], 
+                            },
+                            {"type": "text", "text": example_prompt},
+                            
+                        ]
+                    },
+                ]
+            
+
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        # import pdb;pdb.set_trace() 
+        # return torch.tensor(0)
+        # dummy_loss = torch.tensor(0.0, requires_grad=True).to(model.device)
+        # return dummy_loss
+        if return_outputs:
+            raise ValueError("The GRPOTrainer does not support returning outputs")
+
+        # Move parameter generator to same device as model
+        #model.module.clear_pg_state_dict() # JIC if ref model not separate from base llm
+        #self.parameter_generator.to( model.device )
+        
+        if 'video_path' in inputs[0]:
+            # messages = [{"role": "user", "content": [{"type": "video", "video": inputs[0]["video_path"], "total_pixels": 3584 * 28 * 28, "min_pixels": 16 * 28 * 28,},]}]
+            # image_inputs, video_inputs, video_kwargs = process_vision_info([messages], return_video_kwargs=True)
+            video_inputs = inputs[0]['video_inputs'][0]
+            video_kwargs = inputs[0]['video_kwargs'][0]
+            fps_inputs = video_kwargs['fps']
+            image_inputs = None
+        # try:
+        # [{"role": "user", "content": [{"type": "image", "image": example["image_path"]}]}]
+        elif 'image_path' in inputs[0]:
+            # messages = [{"role": "user", "content": [{"type": "image", "image": inputs[0]["image_path"]}]}]
+            # image_inputs, video_inputs, video_kwargs = process_vision_info([messages], return_video_kwargs=True)
+            image_inputs = inputs[0]['image_inputs'][0]
+            video_inputs = None
+            fps_inputs = None
+        # except Exception as e:
+        #     video_inputs = None
+        prompts = [self.make_conversation_video(example) for example in inputs]
+        # print(prompts)
+        prompts_text = [self.processing_class.apply_chat_template(prompt, tokenize=False, add_generation_prompt=True) for prompt in prompts]
+        
+
+
+        prompt_inputs = self.processing_class(
+            text=prompts_text, 
+            images=image_inputs, 
+            videos=video_inputs, 
+            fps=fps_inputs, 
+            padding=True, 
+            return_tensors="pt", 
+            padding_side="left", 
+            add_special_tokens=False,
+        )
+        prompt_inputs = super()._prepare_inputs(prompt_inputs)
+
+        prompt_ids, prompt_mask = prompt_inputs["input_ids"], prompt_inputs["attention_mask"]
+        if 'pixel_values_videos' in prompt_inputs:
+            pixel_values_videos = prompt_inputs["pixel_values_videos"]
+            video_grid_thw = prompt_inputs["video_grid_thw"]
+        elif 'pixel_values' in prompt_inputs:
+            pixel_values = prompt_inputs["pixel_values"]
+            image_grid_thw = prompt_inputs["image_grid_thw"]
+        
+        # Generate completions        
+        # Step 2: Extract BxD hidden states
+        condition = self._extract_condition(
+            model=model,
+            input_ids=prompt_ids,
+            attention_mask=prompt_mask,
+            pixel_values=None,
+            image_grid_thw=None,
+            pixel_values_videos=pixel_values_videos,
+            video_grid_thw=video_grid_thw,
+        )
+        #breakpoint() # verified that condition extracted from model as HY WU expects
+
+        with torch.no_grad():
+            # Step 3: PG generates LoRA parameters
+            pg_state_dict = self._build_pg_state_dict(condition)
+            #breakpoint() # verified that dimensions align with llm
+            model.module.set_pg_state_dict(pg_state_dict)
+        with unwrap_model_for_generation(model, self.accelerator) as unwrapped_model:
+            # Step 4: Generate with PG-LoRA
+            prompt_completion_ids = unwrapped_model.generate(
+                **prompt_inputs,
+                generation_config=self.generation_config,
+                use_cache=False,
+            )
+
+            prompt_length = prompt_ids.size(1)
+            prompt_ids = prompt_completion_ids[:, :prompt_length]
+            completion_ids = prompt_completion_ids[:, prompt_length:]
+            prompt_mask = prompt_mask.repeat_interleave(self.num_generations, dim=0)
+        model.module.clear_pg_state_dict()
+
+        #breakpoint() # verified that completions are correct at init
+        is_eos = completion_ids == self.processing_class.eos_token_id
+        device = self.accelerator.device
+        eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long, device=device)
+        eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]
+        sequence_indices = torch.arange(is_eos.size(1), device=device).expand(is_eos.size(0), -1)
+        completion_mask = (sequence_indices <= eos_idx.unsqueeze(1)).int()
+
+        # Concatenate prompt_mask with completion_mask for logit computation
+        attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)  # (B*G, P+C)
+        if 'pixel_values_videos' in prompt_inputs:
+            pixel_values_videos = prompt_inputs["pixel_values_videos"].repeat(self.num_generations, 1)
+            video_grid_thw = prompt_inputs["video_grid_thw"].repeat_interleave(self.num_generations, dim=0)
+            pixel_values = None
+            image_grid_thw = None
+        elif 'pixel_values' in prompt_inputs:
+            pixel_values = prompt_inputs["pixel_values"].repeat(self.num_generations, 1)
+            image_grid_thw = prompt_inputs["image_grid_thw"].repeat_interleave(self.num_generations, dim=0)
+            pixel_values_videos = None
+            video_grid_thw = None
+        
+        with torch.inference_mode():
+            if self.ref_model is not None:
+                ref_per_token_logps = self._get_per_token_logps(self.ref_model, prompt_completion_ids, attention_mask, pixel_values_videos, video_grid_thw)
+            else:
+                with self.accelerator.unwrap_model(model).disable_adapter():
+                    ref_per_token_logps = self._get_per_token_logps(model, prompt_completion_ids, attention_mask, pixel_values_videos, video_grid_thw)
+        ref_per_token_logps = ref_per_token_logps[:, prompt_length - 1 :]
+
+        # DDP needs module
+        # Step 3: PG generates LoRA parameters
+        pg_state_dict = self._build_pg_state_dict(condition)
+        # https://discuss.pytorch.org/t/checkpoint-with-no-grad-requiring-inputs-problem/19117/7
+        #self.dummy_tensor_1 = torch.ones(1, dtype=prompt_completion_ids.dtype, requires_grad=True, device=self.parameter_generator.device)
+        #prompt_completion_ids = prompt_completion_ids + self.dummy_tensor_1 - self.dummy_tensor_1
+        #self.dummy_tensor_2 = self.dummy_tensor_2.to(pixel_values_videos.dtype)
+        #pixel_values_videos = pixel_values_videos + self.dummy_tensor_2 - self.dummy_tensor_2
+        #breakpoint() # verified that dimensions align with llm
+        model.module.set_pg_state_dict(pg_state_dict)
+        #breakpoint()
+        per_token_logps = self._get_per_token_logps(model, prompt_completion_ids, attention_mask, pixel_values_videos, video_grid_thw)
+        per_token_logps = per_token_logps[:, prompt_length - 1 :]
+        #breakpoint()
+
+        # Compute the KL divergence between the model and the reference model
+        per_token_kl = torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
+
+        # Decode the generated completions
+        completions = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
+        if is_conversational(inputs[0]):
+            completions = [[{"role": "assistant", "content": completion}] for completion in completions]
+
+        # Compute the rewards
+        prompts = [prompt for prompt in prompts for _ in range(self.num_generations)]
+        # import pdb; pdb.set_trace()
+        item_reward_funcs = self.reward_funcs[inputs[0]['data_type']]
+        item_reward_processing_classes = self.reward_processing_classes[inputs[0]['data_type']]
+        # import pdb;pdb.set_trace()
+        rewards_per_func = torch.zeros(len(prompts), len(item_reward_funcs), device=device)
+        # for key in self.reward_funcs:
+        # torch.distributed.barrier()
+        
+        for i, (reward_func, reward_processing_class) in enumerate(
+            zip(item_reward_funcs, item_reward_processing_classes)
+        ):
+            if isinstance(reward_func, PreTrainedModel):
+                if is_conversational(inputs[0]):
+                    messages = [{"messages": p + c} for p, c in zip(prompts, completions)]
+                    texts = [apply_chat_template(x, reward_processing_class)["text"] for x in messages]
+                else:
+                    texts = [p + c for p, c in zip(prompts, completions)]
+                reward_inputs = reward_processing_class(
+                    texts, return_tensors="pt", padding=True, padding_side="right", add_special_tokens=False
+                )
+                reward_inputs = super()._prepare_inputs(reward_inputs)
+                with torch.inference_mode():
+                    rewards_per_func[:, i] = reward_func(**reward_inputs).logits[:, 0]  # Shape (B*G,)
+            else:
+                # Repeat all input columns (but "prompt" and "completion") to match the number of generations
+                reward_kwargs = {key: [] for key in inputs[0].keys() if key not in ["prompt", "completion"]}
+                for key in reward_kwargs:
+                    for example in inputs:
+                        # Repeat each value in the column for `num_generations` times
+                        reward_kwargs[key].extend([example[key]] * self.num_generations)
+                output_reward_func = reward_func(prompts=prompts, completions=completions, **reward_kwargs)
+                
+                rewards_per_func[:, i] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
+        #breakpoint()
+        # Sum the rewards from all reward functions
+        rewards = rewards_per_func.sum(dim=1)
+
+        # Compute grouped-wise rewards
+        mean_grouped_rewards = rewards.view(-1, self.num_generations).mean(dim=1)
+        std_grouped_rewards = rewards.view(-1, self.num_generations).std(dim=1)
+
+        # Normalize the rewards to compute the advantages
+        mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
+        std_grouped_rewards = std_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
+        advantages = (rewards - mean_grouped_rewards) / (std_grouped_rewards + 1e-4)
+
+        # x - x.detach() allows for preserving gradients from x 
+        # NOTE only for num_iteration == 1
+        per_token_loss = torch.exp(per_token_logps - per_token_logps.detach()) * advantages.unsqueeze(1)
+        per_token_loss = -(per_token_loss - self.beta * per_token_kl)
+        #breakpoint()
+        # per_token_loss = -(per_token_loss)
+        loss = ((per_token_loss * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
+        #breakpoint()
+
+        # Log the metrics
+        completion_length = self.accelerator.gather_for_metrics(completion_mask.sum(1)).float().mean().item()
+        self._metrics["completion_length"].append(completion_length)
+
+        reward_per_func = self.accelerator.gather_for_metrics(rewards_per_func).mean(0)
+        for i, reward_func in enumerate(item_reward_funcs):
+            if isinstance(reward_func, PreTrainedModel):
+                reward_func_name = reward_func.config._name_or_path.split("/")[-1]
+            else:
+                reward_func_name = reward_func.__name__
+            self._metrics[f"rewards/{reward_func_name}"].append(reward_per_func[i].item())
+
+        self._metrics["reward"].append(self.accelerator.gather_for_metrics(rewards).mean().item())
+
+        self._metrics["reward_std"].append(self.accelerator.gather_for_metrics(std_grouped_rewards).mean().item())
+
+        mean_kl = ((per_token_kl * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
+        self._metrics["kl"].append(self.accelerator.gather_for_metrics(mean_kl).mean().item())
+        torch.distributed.barrier()
+        """ print(loss)
+        for name, param in self.parameter_generator.named_parameters():
+            if 'proj_out_B' in name:
+                print(f"{name}: norm={param.data.norm().item():.8f}") """
+        return loss
+
+    def log(self, logs: dict[str, float], start_time: Optional[float] = None) -> None:
+        metrics = {key: sum(val) / len(val) for key, val in self._metrics.items()}  # average the metrics
+        logs = {**logs, **metrics}
+        if version.parse(transformers.__version__) >= version.parse("4.47.0.dev0"):
+            super().log(logs, start_time)
+        else:  # transformers<=4.46
+            super().log(logs)
+        self._metrics.clear()
+
+    def create_model_card(
+        self,
+        model_name: Optional[str] = None,
+        dataset_name: Optional[str] = None,
+        tags: Union[str, list[str], None] = None,
+    ):
+        """
+        Creates a draft of a model card using the information available to the `Trainer`.
+
+        Args:
+            model_name (`str` or `None`, *optional*, defaults to `None`):
+                Name of the model.
+            dataset_name (`str` or `None`, *optional*, defaults to `None`):
+                Name of the dataset used for training.
+            tags (`str`, `list[str]` or `None`, *optional*, defaults to `None`):
+                Tags to be associated with the model card.
+        """
+        if not self.is_world_process_zero():
+            return
+
+        if hasattr(self.model.config, "_name_or_path") and not os.path.isdir(self.model.config._name_or_path):
+            base_model = self.model.config._name_or_path
+        else:
+            base_model = None
+
+        tags = tags or []
+        if isinstance(tags, str):
+            tags = [tags]
+
+        if hasattr(self.model.config, "unsloth_version"):
+            tags.append("unsloth")
+
+        citation = textwrap.dedent(
+            """\
+            @article{zhihong2024deepseekmath,
+                title        = {{DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models}},
+                author       = {Zhihong Shao and Peiyi Wang and Qihao Zhu and Runxin Xu and Junxiao Song and Mingchuan Zhang and Y. K. Li and Y. Wu and Daya Guo},
+                year         = 2024,
+                eprint       = {arXiv:2402.03300},
+            """
+        )
+
+        model_card = generate_model_card(
+            base_model=base_model,
+            model_name=model_name,
+            hub_model_id=self.hub_model_id,
+            dataset_name=dataset_name,
+            tags=tags,
+            wandb_url=wandb.run.get_url() if is_wandb_available() and wandb.run is not None else None,
+            comet_url=get_comet_experiment_url(),
+            trainer_name="GRPO",
+            trainer_citation=citation,
+            paper_title="DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models",
+            paper_id="2402.03300",
+        )
+
+        model_card.save(os.path.join(self.args.output_dir, "README.md"))
+
+    def _extract_condition(
+        self,
+        model,
+        input_ids,
+        attention_mask,
+        pixel_values=None,
+        image_grid_thw=None,
+        pixel_values_videos=None,
+        video_grid_thw=None,
+    ):
+        with torch.no_grad():
+            video_embeds = model.module.get_video_features(pixel_values_videos, video_grid_thw)
+            video_embeds = torch.cat(video_embeds, dim=0)
+        condition = video_embeds.unsqueeze(0).unsqueeze(1) # B,1,T,D
+        #breakpoint()
+        return condition
+    
+    def _build_pg_state_dict(self, condition):
+        #breakpoint()
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            pg_output = self.parameter_generator(condition=condition)
+        #breakpoint()
+        return pg_output
+
+    def _save(self, output_dir: Optional[str] = None, state_dict=None):
+        # If we are executing this function, we are the process zero, so we don't check for that.
+        output_dir = output_dir if output_dir is not None else self.args.output_dir
+        os.makedirs(output_dir, exist_ok=True)
+        print(f"Saving model checkpoint to {output_dir}")
+
+        # Good practice: save your training arguments together with the trained model
+        torch.save(self.args, os.path.join(output_dir, "training_args.bin"))
+        torch.save( self.parameter_generator.state_dict(), os.path.join(output_dir, "pg_weights.bin") )
+    
+    def training_step(
+        self, model, inputs, num_items_in_batch,
+    ) -> torch.Tensor:
+        tr_loss_step = super().training_step(model, inputs, num_items_in_batch)
+        do_sync_step = self.accelerator.sync_gradients
+        if do_sync_step:
+            # Since we perform prefetching, we need to manually set sync_gradients to True
+            self.accelerator.gradient_state._set_sync_gradients(True)
+
+            # Gradient clipping
+            if self.args.max_grad_norm is not None and self.args.max_grad_norm > 0:
+                grad_norm_context = contextlib.nullcontext
+                if self.is_tp_enabled:
+                    from torch.distributed._tensor.experimental import implicit_replication
+
+                    grad_norm_context = implicit_replication
+                with grad_norm_context():
+                    _grad_norm = self.accelerator.clip_grad_norm_(
+                        self.parameter_generator.parameters(),
+                        self.args.max_grad_norm,
+                    )
+        return tr_loss_step
