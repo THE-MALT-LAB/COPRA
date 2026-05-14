@@ -771,9 +771,19 @@ def fetch_clip(ele: dict, duration: float, client = None, image_factor: int = IM
         #breakpoint()
 
         video = video[ frame_idx ]
+        #breakpoint()
+        video = transforms.functional.resize(
+            video,
+            [240, 320], # Conformity with UCF-Crime
+            interpolation=InterpolationMode.BICUBIC,
+            antialias=True,
+        ).float()
+        height = 240
+        width = 320
+        #breakpoint()
         if return_gt:
             filename = ele['video'].split('/')[-1].lower()
-            gt_labels = 0 if 'normal' in filename else 1
+            gt_labels = 0 if 'normal' in filename else 1 # NOTE: THIS IS ONLY FOR UCF CRIME
             #breakpoint()
 
         min_pixels = ele.get("min_pixels", VIDEO_MIN_PIXELS)
