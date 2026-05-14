@@ -8,13 +8,15 @@ from transformers import Qwen2VLForConditionalGeneration, AutoProcessor, Generat
 from wu.config import ParameterGeneratorConfig
 from wu.generator import ParameterGenerator
 from wu.mixin import inject_pg
-
+from accelerate import Accelerator
 
 class PGPipeline:
     def __init__(
         self,
         device_map: str = "auto",
     ):
+        self.accelerator = Accelerator()
+        self.device = self.accelerator.device
         self.model_id = "Qwen/Qwen2-VL-7B-Instruct"
         self.SYSTEM_PROMPT =  """You are the model.
 ** Model Description: **
@@ -55,7 +57,7 @@ Please ONLY reply according to this format, don't give me any other words."""
         )
         self.parameter_generator = ParameterGenerator(self.parameter_generator_config)
         self.parameter_generator.load_state_dict( torch.load("/home/cse_h2/dzj0055/HYWUChat-R1.5/ckpt/FINISHED/pg_weights.bin") )
-        self.parameter_generator = self.parameter_generator.cuda()
+        #self.parameter_generator = self.parameter_generator.cuda()
         self.parameter_generator.eval()
         
         self.model_init_kwargs = {}
@@ -67,8 +69,12 @@ Please ONLY reply according to this format, don't give me any other words."""
             self.parameter_generator.config, Qwen2VLForConditionalGeneration
         ).from_pretrained(self.model_id, **self.model_init_kwargs)
         self.model.enable_pg()
-        self.model = self.model.cuda()
+        #self.model = self.model.cuda()
         self.model.eval()
+        self.parameter_generator, self.model = self.accelerator.prepare(
+            self.parameter_generator,
+            self.model
+        )
 
         self.processing_class = AutoProcessor.from_pretrained(self.model_id)
         pad_token_id = self.processing_class.tokenizer.pad_token_id
@@ -229,7 +235,7 @@ Please ONLY reply according to this format, don't give me any other words."""
         video_grid_thw=None,
     ):
         with torch.no_grad():
-            video_embeds = model.get_video_features(pixel_values_videos, video_grid_thw)
+            video_embeds = model.module.get_video_features(pixel_values_videos, video_grid_thw)
             video_embeds = torch.cat(video_embeds, dim=0)
         condition = video_embeds.unsqueeze(0).unsqueeze(1) # B,1,T,D
         #breakpoint()
@@ -265,6 +271,6 @@ Please ONLY reply according to this format, don't give me any other words."""
         elif isinstance(data, (tuple, list)):
             return type(data)(self._prepare_input(v) for v in data)
         elif isinstance(data, torch.Tensor):
-            kwargs = {"device": "cuda"}
+            kwargs = {"device": self.device}
             return data.to(**kwargs)
         return data
