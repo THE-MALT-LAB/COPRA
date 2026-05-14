@@ -36,6 +36,26 @@ pip install timm
 ```
 NOTE: VLM-R1 will NOT work with higher transformers version v4.57.1 (from HY-WU/requirements.py) without more changes! InternLM2 exposes generate without inheriting from GenerationMixIn
 
+## Evaluation
+
+Please download **UCF-Crime** and **XD-Violence** from the official author mirrors. After downloading, create symbolic links to the dataset directories inside this repository so the evaluation scripts can find them consistently.
+
+### UCF-Crime
+
+To evaluate on UCF-Crime, run:
+
+```bash
+sh eval_vid_level.sh
+```
+
+### XD-Violence
+
+To evaluate on XD-Violence, run:
+
+```bash
+sh eval_vid_level_xd.sh
+```
+
 ## TODO
 
 - [x] Update VLM-R1 to utilize UCF-Crime frames and annotations
