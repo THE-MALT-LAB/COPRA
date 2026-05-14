@@ -178,7 +178,8 @@ class TTSdata(Dataset):
                 # with open(os.path.join(example["video_path"][0], "video_kwargs.json"), 'r') as f:
                 data_to_return["video_kwargs"] = [video_kwargs]
                 data_to_return["problem"] = f"There are {video_inputs[0].size(0)} input frames."
-                data_to_return["solution"] = video_kwargs["gt"]
+                category = example['video_type'].lower()
+                data_to_return["solution"] = [ 0 if 'normal' == category else 1 ]
             elif 'image_path' in example:
                 messages = [{"role": "user", "content": [{"type": "image", "image": example["image_path"]}]}]
                 image_inputs, video_inputs, video_kwargs = process_vision_info([messages], return_video_kwargs=True, client=client)
