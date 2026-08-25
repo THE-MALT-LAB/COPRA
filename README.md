@@ -8,4 +8,4 @@ This repository contains the unified research codebase for:
 
 Please navigate to each subfolder for model-specific installation and evaluation instructions.
 
-Link to weights: https://drive.google.com/drive/folders/1vPP3sV08ZhV2uXLy02xo19pUiHROLToH?usp=sharing
+Link to weights: [Click here](https://drive.google.com/drive/folders/1vPP3sV08ZhV2uXLy02xo19pUiHROLToH?usp=sharing)
