@@ -6,7 +6,7 @@
 
 **Advances in Neural Information Processing Systems (NeurIPS 2026)**
 
-[Darryl Cherian Jacob](https://github.com/dzj0055) · Xinyu Liu · Kai Wang · [Pan He](https://panhe.org/)
+[Darryl Cherian Jacob](https://dzj0055.github.io) · Xinyu Liu · Kai Wang · [Pan He](https://panhe.org/)
 
 Auburn University · Tencent Hunyuan
 
