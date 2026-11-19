@@ -1,0 +1,12 @@
+[submodule "HYWUChat-R1.5/HY-WU"]
+        path = HYWUChat-R1.5/HY-WU
+        url = https://github.com/Tencent-Hunyuan/HY-WU.git
+[submodule "HYWUChat-R1.5/VideoChat-R1"]
+        path = HYWUChat-R1.5/VideoChat-R1
+        url = https://github.com/OpenGVLab/VideoChat-R1.git
+[submodule "HYWUVLM-R1/HY-WU"]
+        path = HYWUVLM-R1/HY-WU
+        url = https://github.com/Tencent-Hunyuan/HY-WU.git
+[submodule "HYWUVLM-R1/VLM-R1"]
+        path = HYWUVLM-R1/VLM-R1
+        url = https://github.com/om-ai-lab/VLM-R1.git
